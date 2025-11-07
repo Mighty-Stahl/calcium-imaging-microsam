@@ -1,6 +1,7 @@
 import numpy as np
 import threading
 from qtpy import QtWidgets
+from qtpy.QtGui import QKeySequence
 from napari.utils.notifications import show_info
 from micro_sam.sam_annotator.annotator_3d import Annotator3d
 from micro_sam.sam_annotator._state import AnnotatorState
@@ -365,6 +366,80 @@ class MicroSAM4DAnnotator(Annotator3d):
                     self._annotator_widget.layout().addWidget(emb_widget)
                 except Exception:
                     pass
+            # --- Remap points UI and Napari points layer ---
+            try:
+                # create / reuse a Napari Points layer named 'remap_points' (3D coords)
+                try:
+                    if "remap_points" in self._viewer.layers:
+                        self._remap_points_layer = self._viewer.layers["remap_points"]
+                    else:
+                        self._remap_points_layer = self._viewer.add_points(np.empty((0, 3)), name="remap_points", ndim=3, face_color='red', size=5)
+                except Exception:
+                    self._remap_points_layer = None
+
+                # right-sidebar widget that will hold per-point remap entries
+                remap_widget = QtWidgets.QWidget()
+                remap_widget.setLayout(QtWidgets.QVBoxLayout())
+                remap_widget.layout().setContentsMargins(4, 4, 4, 4)
+                remap_widget.layout().setSpacing(6)
+                remap_label = QtWidgets.QLabel("Remap points")
+                remap_widget.layout().addWidget(remap_label)
+
+                # Scroll area with a vertical layout for entries
+                try:
+                    scroll = QtWidgets.QScrollArea()
+                    scroll.setWidgetResizable(True)
+                    inner = QtWidgets.QWidget()
+                    inner.setLayout(QtWidgets.QVBoxLayout())
+                    inner.layout().setSpacing(4)
+                    inner.layout().setContentsMargins(0, 0, 0, 0)
+                    scroll.setWidget(inner)
+                    remap_widget.layout().addWidget(scroll)
+                    self._remap_entries_container = inner.layout()
+                except Exception:
+                    # fallback: direct vertical layout
+                    self._remap_entries_container = QtWidgets.QVBoxLayout()
+                    remap_widget.layout().addLayout(self._remap_entries_container)
+
+                # Apply button and shortcut hint
+                apply_btn = QtWidgets.QPushButton("Apply remaps (Shift+R)")
+                remap_widget.layout().addWidget(apply_btn)
+
+                # Insert the remap widget into the annotator panel (after embeddings)
+                try:
+                    self._annotator_widget.layout().addWidget(remap_widget)
+                except Exception:
+                    try:
+                        self._annotator_widget.layout().insertWidget(1, remap_widget)
+                    except Exception:
+                        pass
+
+                # storage for original IDs (aligned with points order) and widget refs
+                self._remap_point_original_ids = []
+                self._remap_target_widgets = []
+
+                # connect points layer -> handler so new points create UI entries
+                try:
+                    if self._remap_points_layer is not None:
+                        # keep a small wrapper that updates originals whenever points change
+                        self._remap_points_layer.events.data.connect(lambda e=None: self._on_remap_points_changed())
+                except Exception:
+                    pass
+
+                # connect apply button
+                try:
+                    apply_btn.clicked.connect(lambda _: self.apply_remaps())
+                except Exception:
+                    pass
+
+                # keyboard shortcut Shift+R to apply remaps
+                try:
+                    shortcut = QtWidgets.QShortcut(QKeySequence("Shift+R"), remap_widget)
+                    shortcut.activated.connect(lambda: self.apply_remaps())
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception:
             # don't fail initialization if Qt isn't available
             pass
@@ -1577,3 +1652,155 @@ class MicroSAM4DAnnotator(Annotator3d):
                             self._segmentation_cache[t] = self.segmentation_4d[t].copy()
             except Exception:
                 pass
+
+    # ----------------- Remap points helpers -----------------
+    def _on_remap_points_changed(self):
+        """Called whenever `remap_points` layer data changes.
+
+        Adds/removes UI entries and records the original segment ID under each point
+        for the current timestep.
+        """
+        try:
+            lay = getattr(self, "_remap_points_layer", None)
+            if lay is None:
+                return
+            pts = np.array(getattr(lay, "data", []))
+            if pts is None:
+                pts = np.empty((0, 3))
+
+            n = len(pts)
+            prev = len(getattr(self, "_remap_point_original_ids", []))
+
+            # remove trailing widgets if points were deleted
+            if n < prev:
+                try:
+                    while len(self._remap_target_widgets) > n:
+                        w = self._remap_target_widgets.pop()
+                        widget = w.get("widget")
+                        try:
+                            self._remap_entries_container.removeWidget(widget)
+                        except Exception:
+                            pass
+                        try:
+                            widget.setParent(None)
+                        except Exception:
+                            pass
+                        self._remap_point_original_ids.pop()
+                except Exception:
+                    pass
+
+            # For each point, compute original segment id and create UI entry if new
+            for i in range(n):
+                try:
+                    coord = pts[i]
+                    z = int(round(float(coord[0])))
+                    y = int(round(float(coord[1])))
+                    x = int(round(float(coord[2])))
+                    orig = 0
+                    try:
+                        if self.segmentation_4d is not None and 0 <= self.current_timestep < self.n_timesteps:
+                            vol = self.segmentation_4d[int(self.current_timestep)]
+                            # bounds check
+                            if 0 <= z < vol.shape[0] and 0 <= y < vol.shape[1] and 0 <= x < vol.shape[2]:
+                                orig = int(vol[z, y, x])
+                    except Exception:
+                        orig = 0
+
+                    if i < prev:
+                        # update stored original id and refresh label text
+                        try:
+                            self._remap_point_original_ids[i] = orig
+                            self._remap_target_widgets[i]["label"].setText(f"Point #{i+1} (orig {orig}) → target ID:")
+                        except Exception:
+                            pass
+                    else:
+                        # create new UI entry for this point
+                        try:
+                            self._add_remap_entry(i, orig)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _add_remap_entry(self, index: int, original_id: int):
+        """Create a labeled entry (label + SpinBox) for a remap point and add it to the UI container."""
+        try:
+            container = QtWidgets.QWidget()
+            container.setLayout(QtWidgets.QHBoxLayout())
+            container.layout().setContentsMargins(0, 0, 0, 0)
+            label = QtWidgets.QLabel(f"Point #{index+1} (orig {original_id}) → target ID:")
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(0, 2_000_000_000)
+            spin.setValue(0)
+            container.layout().addWidget(label)
+            container.layout().addWidget(spin)
+
+            try:
+                self._remap_entries_container.addWidget(container)
+            except Exception:
+                try:
+                    # If container is a QVBoxLayout instance
+                    self._remap_entries_container.addWidget(container)
+                except Exception:
+                    pass
+
+            # store references aligned with points order
+            try:
+                self._remap_point_original_ids.append(int(original_id))
+            except Exception:
+                self._remap_point_original_ids.append(0)
+            self._remap_target_widgets.append({"widget": container, "label": label, "spin": spin})
+        except Exception:
+            pass
+
+    def apply_remaps(self):
+        """Apply all remapping rules defined by remap points and their target widgets.
+
+        Replaces every voxel of each point's original segment ID with the specified
+        target ID in the current timestep's segmentation layer.
+        """
+        try:
+            t = int(getattr(self, "current_timestep", 0) or 0)
+            if self.segmentation_4d is None:
+                show_info("No segmentation loaded; cannot apply remaps.")
+                return
+
+            # iterate over entries
+            for i, entry in enumerate(self._remap_target_widgets):
+                try:
+                    orig = int(self._remap_point_original_ids[i])
+                    target = int(entry["spin"].value())
+                    if orig == 0:
+                        # skip background/no-op
+                        continue
+                    if target == orig:
+                        continue
+                    # call existing remapping helper (will update layer and cache)
+                    try:
+                        self.remap_segment_id(timestep=t, old_id=orig, new_id=target, propagate_forward=False)
+                    except Exception:
+                        # fallback: manual replace
+                        try:
+                            mask = self.segmentation_4d[t] == orig
+                            if np.any(mask):
+                                self.segmentation_4d[t][mask] = target
+                                layer = self._viewer.layers.get("committed_objects_4d")
+                                if layer is not None:
+                                    layer.data = self.segmentation_4d
+                                    try:
+                                        layer.refresh()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            try:
+                show_info("Remapping applied for current timestep.")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Failed to apply remaps: {e}")

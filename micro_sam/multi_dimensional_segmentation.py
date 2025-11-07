@@ -26,8 +26,8 @@ except ImportError:
     from tqdm import tqdm
 
 try:
-    from trackastra.model import Trackastra
-    from trackastra.tracking import graph_to_ctc, graph_to_napari_tracks
+    from trackastra.model import Trackastra # type: ignore # not used
+    from trackastra.tracking import graph_to_ctc, graph_to_napari_tracks # type: ignore
 except ImportError:
     Trackastra = None
 
