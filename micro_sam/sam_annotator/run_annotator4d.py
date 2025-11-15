@@ -99,8 +99,8 @@ def main(argv=None):
         print(f"Failed to inspect loaded array: {e}")
         return 2
 
-    # 🔹 Limit to the first 4 timesteps for testing
-    image4d = image4d[1:5]
+    # Limit timestep sbased on what u like
+    image4d = image4d[1:4]
     print(f"Trimmed: new shape = {image4d.shape}")
 
     # create Napari viewer and annotator

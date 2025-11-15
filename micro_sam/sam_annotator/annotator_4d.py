@@ -88,13 +88,27 @@ class TimestepEmbeddingManager:
         return self.cached_entry
 
     def on_timestep_changed(self, t: int):
-        """Callback for timestep changes; triggers loading for timestep `t`."""
+        """Callback for timestep changes; triggers embedding loading and 4D-aware point updates."""
+        self.current_timestep = t
+
+        # --- update 4D point prompts ---
         try:
-            # schedule load in background to avoid blocking the UI
-            thread = threading.Thread(target=self.load_embedding_for_timestep, args=(int(t),), daemon=True)
+            if hasattr(self, "point_prompts"):
+                pts_t = np.array(self.point_prompts.get(t, np.empty((0, 3))))
+                if "point_prompts" in self._viewer.layers:
+                    self._viewer.layers["point_prompts"].data = pts_t
+        except Exception as e:
+            print(f"[WARN] Failed updating 4D point prompts at timestep {t}: {e}")
+
+        # --- background embedding loading ---
+        try:
+            thread = threading.Thread(
+                target=self.load_embedding_for_timestep,
+                args=(int(t),),
+                daemon=True,
+            )
             thread.start()
         except Exception:
-            # best-effort synchronous fallback
             try:
                 self.load_embedding_for_timestep(int(t))
             except Exception:
@@ -289,7 +303,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.segmentation_4d = None
         self.auto_segmentation_4d = None
         self.current_object_4d = None
-        self.point_prompts_4d = None
+        self.point_prompts = None
         self.n_timesteps = 0
         # small per-timestep cache (optional)
         self._segmentation_cache = None
@@ -545,7 +559,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.segmentation_4d = np.zeros_like(image_4d, dtype=np.uint32)
         self.auto_segmentation_4d = np.zeros_like(image_4d, dtype=np.uint32)
         self.current_object_4d = np.zeros_like(image_4d, dtype=np.uint32)
-        self.point_prompts_4d = [None] * self.n_timesteps
+        self.point_prompts = [None] * self.n_timesteps
         self._segmentation_cache = [self.segmentation_4d[t].copy() for t in range(self.n_timesteps)]
 
         # add or update persistent 4D labels layers so Napari edits directly
@@ -573,16 +587,30 @@ class MicroSAM4DAnnotator(Annotator3d):
                 self._viewer.add_labels(data=self.auto_segmentation_4d, name="auto_segmentation_4d")
         except Exception:
             pass
-
-        # single persistent points layer for prompts (we update .data in-place)
+        
+        # make point_prompts 4D-aware: each timestep has its own points
         try:
-            pts0 = np.array(self.point_prompts_4d[0]) if self.point_prompts_4d[0] is not None else np.empty((0, 3))
+            if not hasattr(self, "point_prompts"):
+                # initialize dictionary to hold points per timestep
+                self.point_prompts = {}
+
+            t = getattr(self, "current_timestep", 0)
+            pts_t = np.array(self.point_prompts.get(t, np.empty((0, 3))))
+
+            # if layer exists, update its data
             if "point_prompts" in self._viewer.layers:
-                self._viewer.layers["point_prompts"].data = pts0
+                self._viewer.layers["point_prompts"].data = pts_t
             else:
-                self._viewer.add_points(pts0, name="point_prompts")
-        except Exception:
-            pass
+                self._viewer.add_points(pts_t, name="point_prompts")
+
+            # listener: when user adds/deletes points, save back to the correct timestep
+            def _update_point_prompts(event=None):
+                self.point_prompts[t] = np.array(self._viewer.layers["point_prompts"].data)
+
+            self._viewer.layers["point_prompts"].events.data.connect(_update_point_prompts)
+
+        except Exception as e:
+            print(f"Error initializing 4D-aware point prompts: {e}")
 
         # ensure raw_4d is bottom-most layer
         self._reorder_layers()
@@ -632,7 +660,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             if prev_t is not None and "point_prompts" in self._viewer.layers:
                 try:
                     pts = np.array(self._viewer.layers["point_prompts"].data)
-                    self.point_prompts_4d[prev_t] = pts if pts.size else None
+                    self.point_prompts[prev_t] = pts if pts.size else None
                 except Exception:
                     pass
         except Exception:
@@ -657,7 +685,7 @@ class MicroSAM4DAnnotator(Annotator3d):
 
         # refresh points layer to the new timestep (in-place)
         try:
-            pts_new = self.point_prompts_4d[new_t]
+            pts_new = self.point_prompts[new_t]
             lay = self._viewer.layers.get("point_prompts", None)
             if lay is not None:
                 lay.data = np.array(pts_new) if pts_new is not None else np.empty((0, 3))
@@ -767,7 +795,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         if "point_prompts" in self._viewer.layers:
             try:
                 pts = np.array(self._viewer.layers["point_prompts"].data)
-                self.point_prompts_4d[t] = pts
+                self.point_prompts[t] = pts
             except Exception:
                 pass
 
@@ -1402,85 +1430,95 @@ class MicroSAM4DAnnotator(Annotator3d):
 
     def _on_dims_current_step(self, event):
         """Handle napari dims current_step changes (time slider).
-
         Persists current 3D edits and loads the new timestep into the 3D views.
+        Each timestep now keeps independent point prompts (4D-aware).
         """
-        # robustly read new step value
+        import numpy as np
+
+        # --- detect new timestep ---
         try:
             val = getattr(event, "value", None)
             if val is None:
                 val = getattr(event, "current_step", None) or getattr(self._viewer.dims, "current_step", None)
-        except Exception:
-            val = None
-        if val is None:
-            return
-        try:
             new_t = int(val[0]) if isinstance(val, (list, tuple)) else int(val)
         except Exception:
             return
 
-        # If the time index didn't actually change, do not treat this
-        # as a timestep switch — the user may have adjusted Z/Y/X sliders.
-        if new_t == getattr(self, "current_timestep", None):
-            # nothing to do for time change; allow Napari to handle other axes
+        prev_t = getattr(self, "current_timestep", None)
+        if new_t == prev_t:
             return
 
-        # persist point prompts for previous timestep
+        # --- persist old points ---
         try:
-            prev = getattr(self, "current_timestep", None)
-            if prev is not None and "point_prompts" in self._viewer.layers:
+            if prev_t is not None and "point_prompts" in self._viewer.layers:
                 pts = np.array(self._viewer.layers["point_prompts"].data)
-                self.point_prompts_4d[prev] = pts if pts.size else None
-        except Exception:
-            pass
+                if not hasattr(self, "point_prompts_4d"):
+                    self.point_prompts_4d = {}
+                self.point_prompts_4d[prev_t] = pts.copy() if pts.size else np.empty((0, 3))
+        except Exception as e:
+            print(f"[WARN] Save point prompts failed: {e}")
 
-        # keep internal arrays referencing layer data (edits mutate layer.data)
-        try:
-            if "committed_objects_4d" in self._viewer.layers:
-                self.segmentation_4d = self._viewer.layers["committed_objects_4d"].data
-            if "current_object_4d" in self._viewer.layers:
-                self.current_object_4d = self._viewer.layers["current_object_4d"].data
-            if "auto_segmentation_4d" in self._viewer.layers:
-                self.auto_segmentation_4d = self._viewer.layers["auto_segmentation_4d"].data
-        except Exception:
-            pass
+        # --- update current timestep ---
+        self.current_timestep = new_t
 
-        # switch displayed timestep without recreating layers
+        # --- embeddings switching ---
         try:
-            if new_t != self.current_timestep:
-                # Use the timestep embedding manager if available to lazily load
-                # and activate per-timestep zarr embeddings. Falls back to the
-                # existing activation method when no manager is present.
+            mgr = getattr(self, "timestep_embedding_manager", None)
+            if mgr is not None:
                 try:
-                    mgr = getattr(self, "timestep_embedding_manager", None)
-                    if mgr is not None:
-                        try:
-                            mgr.on_timestep_changed(new_t)
-                        except Exception:
-                            # fallback
-                            try:
-                                self._ensure_embeddings_active_for_t(new_t)
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            self._ensure_embeddings_active_for_t(new_t)
-                        except Exception:
-                            pass
+                    mgr.on_timestep_changed(new_t)
                 except Exception:
-                    pass
-                self._load_timestep(new_t)
+                    self._ensure_embeddings_active_for_t(new_t)
+            else:
+                self._ensure_embeddings_active_for_t(new_t)
         except Exception:
             pass
 
-    def previous_timestep(self):
-        """Move to the previous timestep (if available)."""
-        self.save_current_object_to_4d()
-        self.save_point_prompts()
-        if self.current_timestep - 1 >= 0:
-            self._load_timestep(self.current_timestep - 1)
-        else:
-            print("🚫 Already at first timestep.")
+        # --- load the new timestep volume ---
+        try:
+            self._load_timestep(new_t)
+        except Exception as e:
+            print(f"[WARN] Load timestep failed: {e}")
+
+        # --- load per-timestep point prompts ---
+        try:
+            if not hasattr(self, "point_prompts_4d"):
+                self.point_prompts_4d = {}
+
+            new_pts = self.point_prompts_4d.get(new_t, np.empty((0, 3)))
+
+            # if layer doesn't exist yet, create once
+            if "point_prompts" not in self._viewer.layers:
+                layer = self._viewer.add_points(
+                    new_pts,
+                    name="point_prompts",
+                    size=10,
+                    face_color="green",  # SAM positive color
+                    edge_color="black",
+                    blending="translucent",
+                )
+                # SAM-style color cycle
+                layer.face_color_cycle = ["limegreen", "red"]
+            else:
+                layer = self._viewer.layers["point_prompts"]
+                layer.data = new_pts
+
+            # --- reconnect event listener cleanly ---
+            try:
+                if hasattr(self, "_point_prompt_connection"):
+                    layer.events.data.disconnect(self._point_prompt_connection)
+            except Exception:
+                pass
+
+            def _update_points(event=None):
+                t_now = getattr(self, "current_timestep", 0)
+                self.point_prompts_4d[t_now] = np.array(layer.data)
+
+            self._point_prompt_connection = _update_points
+            layer.events.data.connect(self._point_prompt_connection)
+
+        except Exception as e:
+            print(f"[WARN] Reload point prompts failed: {e}")
 
     def next_timestep(self):
         """Move to the next timestep (if available)."""
