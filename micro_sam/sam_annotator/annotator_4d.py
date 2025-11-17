@@ -117,10 +117,10 @@ class TimestepEmbeddingManager:
 
         # --- update 4D point prompts ---
         try:
-            if hasattr(self, "point_prompts"):
-                pts_t = np.array(self.point_prompts.get(t, np.empty((0, 3))))
-                if "point_prompts" in self._viewer.layers:
-                    self._viewer.layers["point_prompts"].data = pts_t
+            if hasattr(self.annotator, "point_prompts_4d"):
+                pts_t = np.array(self.annotator.point_prompts_4d.get(t, np.empty((0, 3))))
+                if "point_prompts" in self.annotator._viewer.layers:
+                    self.annotator._viewer.layers["point_prompts"].data = pts_t
         except Exception as e:
             print(f"[WARN] Failed updating 4D point prompts at timestep {t}: {e}")
 
@@ -327,7 +327,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.segmentation_4d = None
         self.auto_segmentation_4d = None
         self.current_object_4d = None
-        self.point_prompts = None
+        # 4D-aware point prompts: dict mapping timestep -> points array
+        self.point_prompts_4d = {}
         self.n_timesteps = 0
         # small per-timestep cache (optional)
         self._segmentation_cache = None
@@ -583,7 +584,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.segmentation_4d = np.zeros_like(image_4d, dtype=np.uint32)
         self.auto_segmentation_4d = np.zeros_like(image_4d, dtype=np.uint32)
         self.current_object_4d = np.zeros_like(image_4d, dtype=np.uint32)
-        self.point_prompts = [None] * self.n_timesteps
+        # Initialize 4D-aware point prompts dictionary
+        self.point_prompts_4d = {}
         self._segmentation_cache = [self.segmentation_4d[t].copy() for t in range(self.n_timesteps)]
 
         # add or update persistent 4D labels layers so Napari edits directly
@@ -620,22 +622,24 @@ class MicroSAM4DAnnotator(Annotator3d):
         
         # make point_prompts 4D-aware: each timestep has its own points
         try:
-            if not hasattr(self, "point_prompts"):
-                # initialize dictionary to hold points per timestep
-                self.point_prompts = {}
-
             t = getattr(self, "current_timestep", 0)
-            pts_t = np.array(self.point_prompts.get(t, np.empty((0, 3))))
+            pts_t = np.array(self.point_prompts_4d.get(t, np.empty((0, 3))))
 
             # if layer exists, update its data
             if "point_prompts" in self._viewer.layers:
                 self._viewer.layers["point_prompts"].data = pts_t
             else:
-                self._viewer.add_points(pts_t, name="point_prompts")
+                layer = self._viewer.add_points(pts_t, name="point_prompts", size=10,
+                                                face_color="green", edge_color="black",
+                                                blending="translucent")
+                # SAM-style color cycle
+                layer.face_color_cycle = ["limegreen", "red"]
 
-            # listener: when user adds/deletes points, save back to the correct timestep
+            # listener: when user adds/deletes points, save back to the CURRENT timestep
             def _update_point_prompts(event=None):
-                self.point_prompts[t] = np.array(self._viewer.layers["point_prompts"].data)
+                # Get current timestep dynamically, not from closure
+                t_now = getattr(self, "current_timestep", 0)
+                self.point_prompts_4d[t_now] = np.array(self._viewer.layers["point_prompts"].data)
 
             self._viewer.layers["point_prompts"].events.data.connect(_update_point_prompts)
 
@@ -690,7 +694,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             if prev_t is not None and "point_prompts" in self._viewer.layers:
                 try:
                     pts = np.array(self._viewer.layers["point_prompts"].data)
-                    self.point_prompts[prev_t] = pts if pts.size else None
+                    self.point_prompts_4d[prev_t] = pts.copy() if pts.size else np.empty((0, 3))
                 except Exception:
                     pass
         except Exception:
@@ -715,7 +719,7 @@ class MicroSAM4DAnnotator(Annotator3d):
 
         # refresh points layer to the new timestep (in-place)
         try:
-            pts_new = self.point_prompts[new_t]
+            pts_new = self.point_prompts_4d.get(new_t, np.empty((0, 3)))
             lay = self._viewer.layers["point_prompts"] if "point_prompts" in self._viewer.layers else None
             if lay is not None:
                 lay.data = np.array(pts_new) if pts_new is not None else np.empty((0, 3))
@@ -821,11 +825,11 @@ class MicroSAM4DAnnotator(Annotator3d):
 
     def save_point_prompts(self):
         """Save the point_prompts 3D layer into per-timestep storage."""
-        t = self.current_timestep
+        t = int(getattr(self, "current_timestep", 0) or 0)
         if "point_prompts" in self._viewer.layers:
             try:
                 pts = np.array(self._viewer.layers["point_prompts"].data)
-                self.point_prompts[t] = pts
+                self.point_prompts_4d[t] = pts.copy() if pts.size else np.empty((0, 3))
             except Exception:
                 pass
 
@@ -2077,6 +2081,21 @@ class MicroSAM4DAnnotator(Annotator3d):
         # Mapping of per-timestep prompts
         prompt_map = getattr(self, "point_prompts_4d", None) or {}
 
+        # Get point prompts layer reference
+        point_layer = self._viewer.layers["point_prompts"] if "point_prompts" in self._viewer.layers else None
+
+        # Remember original timestep to restore at the end
+        original_t = getattr(self, "current_timestep", 0)
+        original_pts = prompt_map.get(original_t, np.empty((0, 3)))
+
+        # Disconnect point prompts event listener during batch segmentation to prevent interference
+        if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
+            try:
+                if hasattr(self, '_point_prompt_connection'):
+                    point_layer.events.data.disconnect(self._point_prompt_connection)
+            except Exception:
+                pass
+
         # Access volumetric segmentation widget if available
         try:
             state = AnnotatorState()
@@ -2090,6 +2109,9 @@ class MicroSAM4DAnnotator(Annotator3d):
             if pts_arr.size == 0:
                 continue
 
+            # Update current timestep internally without triggering full UI updates
+            self.current_timestep = int(t)
+
             # Activate embeddings/predictor for this timestep
             try:
                 if getattr(self, "timestep_embedding_manager", None) is not None:
@@ -2101,16 +2123,15 @@ class MicroSAM4DAnnotator(Annotator3d):
             except Exception:
                 pass
 
-            # Show timestep t and its prompts
+            # Manually set point prompts for this timestep without triggering callbacks
             try:
-                self._load_timestep(int(t))
-            except Exception:
-                pass
-            try:
-                if "point_prompts" in self._viewer.layers:
-                    self._viewer.layers["point_prompts"].data = pts_arr
-                else:
-                    self._viewer.add_points(pts_arr, name="point_prompts")
+                if point_layer is not None:
+                    point_layer.data = pts_arr
+                elif "point_prompts" not in self._viewer.layers:
+                    point_layer = self._viewer.add_points(pts_arr, name="point_prompts", size=10,
+                                                          face_color="green", edge_color="black",
+                                                          blending="translucent")
+                    point_layer.face_color_cycle = ["limegreen", "red"]
             except Exception:
                 pass
 
@@ -2167,6 +2188,22 @@ class MicroSAM4DAnnotator(Annotator3d):
                         lay.refresh()
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+        # Restore original timestep and its point prompts
+        try:
+            self.current_timestep = int(original_t)
+            if point_layer is not None:
+                point_layer.data = np.asarray(original_pts) if original_pts is not None else np.empty((0, 3))
+        except Exception:
+            pass
+
+        # Reconnect point prompts event listener
+        if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
+            try:
+                if hasattr(self, '_point_prompt_connection'):
+                    point_layer.events.data.connect(self._point_prompt_connection)
             except Exception:
                 pass
 
@@ -2241,7 +2278,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         # Cleanup: clear all point prompts and current object masks after committing
         # Clear stored per-timestep prompts
         try:
-            self.point_prompts = {}
+            self.point_prompts_4d = {}
         except Exception:
             pass
         # Clear napari points layer
