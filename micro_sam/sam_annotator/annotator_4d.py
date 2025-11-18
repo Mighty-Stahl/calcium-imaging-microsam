@@ -633,6 +633,25 @@ class MicroSAM4DAnnotator(Annotator3d):
                                                 blending="translucent")
                 # SAM-style color cycle
                 layer.face_color_cycle = ["limegreen", "red"]
+                
+                # Setup cursor handling for point prompts layer
+                try:
+                    canvas = self._viewer.window.qt_viewer.canvas.native
+                    
+                    def on_mouse_leave(event):
+                        """Reset cursor to normal when leaving the viewer"""
+                        try:
+                            canvas.setCursor(Qt.ArrowCursor)
+                        except Exception:
+                            pass
+                    
+                    # Connect to canvas leave event
+                    try:
+                        canvas.leaveEvent = lambda event: on_mouse_leave(event)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
             # listener: when user adds/deletes points, save back to the CURRENT timestep
             def _update_point_prompts(event=None):
@@ -1535,6 +1554,25 @@ class MicroSAM4DAnnotator(Annotator3d):
                 )
                 # SAM-style color cycle
                 layer.face_color_cycle = ["limegreen", "red"]
+                
+                # Setup cursor handling for point prompts layer
+                try:
+                    canvas = self._viewer.window.qt_viewer.canvas.native
+                    
+                    def on_mouse_leave(event):
+                        """Reset cursor to normal when leaving the viewer"""
+                        try:
+                            canvas.setCursor(Qt.ArrowCursor)
+                        except Exception:
+                            pass
+                    
+                    # Connect to canvas leave event
+                    try:
+                        canvas.leaveEvent = lambda event: on_mouse_leave(event)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             else:
                 layer = self._viewer.layers["point_prompts"]
                 layer.data = new_pts
@@ -2034,6 +2072,25 @@ class MicroSAM4DAnnotator(Annotator3d):
                                                           face_color="green", edge_color="black",
                                                           blending="translucent")
                     point_layer.face_color_cycle = ["limegreen", "red"]
+                    
+                    # Setup cursor handling for point prompts layer
+                    try:
+                        canvas = self._viewer.window.qt_viewer.canvas.native
+                        
+                        def on_mouse_leave(event):
+                            """Reset cursor to normal when leaving the viewer"""
+                            try:
+                                canvas.setCursor(Qt.ArrowCursor)
+                            except Exception:
+                                pass
+                        
+                        # Connect to canvas leave event
+                        try:
+                            canvas.leaveEvent = lambda event: on_mouse_leave(event)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
