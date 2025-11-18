@@ -498,26 +498,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                     shortcut.activated.connect(lambda: self.apply_remaps())
                 except Exception:
                     pass
-                # connect canvas mouse-move to hover handler (best-effort; multiple fallbacks)
-                try:
-                    # try Qt canvas events first
-                    try:
-                        canvas = getattr(self._viewer.window.qt_viewer, "canvas", None)
-                        if canvas is not None and hasattr(canvas.events, "mouse_move"):
-                            canvas.events.mouse_move.connect(self._on_canvas_mouse_move)
-                        else:
-                            # fallback to viewer-level callback list
-                            try:
-                                self._viewer.mouse_move_callbacks.append(lambda viewer, event: self._on_canvas_mouse_move(event))
-                            except Exception:
-                                pass
-                    except Exception:
-                        try:
-                            self._viewer.mouse_move_callbacks.append(lambda viewer, event: self._on_canvas_mouse_move(event))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
             except Exception:
                 pass
         except Exception:
@@ -1979,112 +1959,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                 pass
         except Exception as e:
             print(f"Failed to clear remap points: {e}")
-
-    def _on_canvas_mouse_move(self, event):
-        """Handle canvas/viewer mouse-move events and update hovered segment ID label.
-
-        This is best-effort and uses several fallbacks to extract a world position
-        from the event, map it to the `committed_objects_4d` layer data coords,
-        and read the label at the current timestep.
-        """
-        try:
-            # try common attributes for position
-            pos = None
-            if hasattr(event, "position"):
-                pos = getattr(event, "position")
-            elif hasattr(event, "pos"):
-                pos = getattr(event, "pos")
-            else:
-                # some callbacks pass (viewer, event) and our lambda passes only event
-                try:
-                    # event may be a dict-like object
-                    pos = event.get("position") if isinstance(event, dict) else None
-                except Exception:
-                    pos = None
-
-            if pos is None:
-                return
-
-            # ensure it's a sequence
-            try:
-                pos_list = list(pos)
-            except Exception:
-                return
-
-            layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
-            if layer is None:
-                return
-
-            # map world coords to layer data coords
-            try:
-                data_coords = layer.world_to_data(pos_list)
-            except Exception:
-                # fallback: some napari versions expose world_to_data as a function on viewer
-                try:
-                    data_coords = self._viewer.window.qt_viewer.canvas.world_to_data(pos_list)
-                except Exception:
-                    data_coords = None
-
-            if data_coords is None:
-                return
-
-            # data_coords may be length >=3 (for Z,Y,X) or include time; use last 3 as Z,Y,X
-            try:
-                coords = [int(round(float(c))) for c in data_coords[-3:]]
-                z, y, x = coords
-            except Exception:
-                return
-
-            t = int(getattr(self, "current_timestep", 0) or 0)
-            if self.segmentation_4d is None:
-                return
-            if not (0 <= t < self.n_timesteps):
-                return
-
-            vol = self.segmentation_4d[t]
-            label = 0
-            try:
-                if 0 <= z < vol.shape[0] and 0 <= y < vol.shape[1] and 0 <= x < vol.shape[2]:
-                    label = int(vol[z, y, x])
-            except Exception:
-                label = 0
-
-            # update displayed hover label when changed
-            try:
-                if getattr(self, "_last_hover_label", None) != label:
-                    self._last_hover_label = label
-                    # update right-sidebar label (keeps compatibility)
-                    if getattr(self, "_hover_id_label", None) is not None:
-                        try:
-                            self._hover_id_label.setText(f"Hovered ID: {label}")
-                        except Exception:
-                            pass
-                    # show floating tooltip next to cursor for non-background labels
-                    try:
-                        if getattr(self, "_hover_tooltip", None) is not None:
-                            if label and label != 0:
-                                try:
-                                    txt = str(label)
-                                    self._hover_tooltip.setText(txt)
-                                    self._hover_tooltip.adjustSize()
-                                    # position slightly offset from cursor
-                                    gp = QCursor.pos()
-                                    # QPoint values may be used directly
-                                    self._hover_tooltip.move(gp.x() + 12, gp.y() + 12)
-                                    self._hover_tooltip.show()
-                                except Exception:
-                                    pass
-                            else:
-                                try:
-                                    self._hover_tooltip.hide()
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        except Exception:
-            pass
 
     def segment_all_timesteps(self):
         """Run manual segmentation for all timesteps that have point prompts.

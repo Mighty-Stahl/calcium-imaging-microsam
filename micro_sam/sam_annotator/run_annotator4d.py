@@ -118,7 +118,7 @@ def main(argv=None):
     # persistent 4D layers referencing this array.
     annot.update_image(image4d)
 
-    print("viewer loaded")
+    print("🤩 Viewer Loaded 🤩")
 
     # show Napari GUI (blocking)
     napari.run()
