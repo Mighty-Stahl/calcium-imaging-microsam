@@ -134,28 +134,31 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             
             # Remove point prompts associated with this object ID
             try:
-                if hasattr(self._annotator, "_point_prompt_ids") and timestep in self._annotator._point_prompt_ids:
-                    point_ids = self._annotator._point_prompt_ids[timestep]
+                if "point_prompts" in self._annotator._viewer.layers:
+                    layer = self._annotator._viewer.layers["point_prompts"]
+                    points = np.array(layer.data)
                     
-                    # Find indices of points with this object ID
-                    indices_to_remove = [i for i, pid in enumerate(point_ids) if pid == obj_id]
+                    # Get IDs for all points
+                    point_ids = self._annotator._get_point_ids_for_timestep(timestep, points)
                     
-                    if indices_to_remove and "point_prompts" in self._annotator._viewer.layers:
-                        layer = self._annotator._viewer.layers["point_prompts"]
-                        points = np.array(layer.data)
-                        
-                        # Remove points in reverse order to maintain indices
-                        for idx in sorted(indices_to_remove, reverse=True):
-                            if idx < len(points):
-                                points = np.delete(points, idx, axis=0)
-                                point_ids.pop(idx)
-                        
+                    # Find points with this object ID and remove them
+                    points_to_keep = []
+                    for idx, (point, pid) in enumerate(zip(points, point_ids)):
+                        if pid != obj_id:
+                            points_to_keep.append(point)
+                        else:
+                            # Remove from coordinate map
+                            z, y, x = int(point[0]), int(point[1]), int(point[2])
+                            key = (timestep, z, y, x)
+                            if key in self._annotator.point_id_map:
+                                del self._annotator.point_id_map[key]
+                    
+                    if len(points_to_keep) < len(points):
                         # Update layer and stored data
-                        layer.data = points
-                        self._annotator.point_prompts_4d[timestep] = points
-                        self._annotator._point_prompt_ids[timestep] = point_ids
-                        
-                        print(f"Removed {len(indices_to_remove)} point prompt(s) for object ID {obj_id}")
+                        new_points = np.array(points_to_keep) if points_to_keep else np.empty((0, 3))
+                        layer.data = new_points
+                        self._annotator.point_prompts_4d[timestep] = new_points
+                        print(f"Removed {len(points) - len(points_to_keep)} point prompt(s) for object ID {obj_id}")
             except Exception as e:
                 print(f"Warning: Could not remove point prompts: {e}")
             
@@ -215,12 +218,6 @@ class PointPromptManagerWidget(QtWidgets.QWidget):
         
         # Store point entry widgets
         self._point_entries = []
-        
-        # Initialize annotator's point ID tracking
-        if not hasattr(self._annotator, "_current_point_id"):
-            self._annotator._current_point_id = 1
-        if not hasattr(self._annotator, "_point_prompt_ids"):
-            self._annotator._point_prompt_ids = {}
     
     def refresh_point_list(self):
         """Refresh the list of point prompts for current timestep."""
@@ -253,18 +250,8 @@ class PointPromptManagerWidget(QtWidgets.QWidget):
                 self._point_entries.append({"widget": label})
                 return
             
-            # Get current IDs for these points
-            if not hasattr(self._annotator, "_point_prompt_ids"):
-                self._annotator._point_prompt_ids = {}
-            if t not in self._annotator._point_prompt_ids:
-                self._annotator._point_prompt_ids[t] = [1] * len(points)
-            
-            point_ids = self._annotator._point_prompt_ids[t]
-            
-            # Ensure we have IDs for all points
-            while len(point_ids) < len(points):
-                point_ids.append(1)
-            self._annotator._point_prompt_ids[t] = point_ids[:len(points)]
+            # Get IDs for all points based on their coordinates
+            point_ids = self._annotator._get_point_ids_for_timestep(t, points)
             
             # Create entry for each point
             for idx, point in enumerate(points):
@@ -316,28 +303,27 @@ class PointPromptManagerWidget(QtWidgets.QWidget):
     def _update_point_id(self, point_idx: int, new_id: int, timestep: int):
         """Update the ID for a specific point."""
         try:
-            if not hasattr(self._annotator, "_point_prompt_ids"):
-                self._annotator._point_prompt_ids = {}
+            # Get point coordinates from the layer
+            if "point_prompts" not in self._annotator._viewer.layers:
+                return
             
-            if timestep not in self._annotator._point_prompt_ids:
-                self._annotator._point_prompt_ids[timestep] = []
+            layer = self._annotator._viewer.layers["point_prompts"]
+            points = np.array(layer.data)
             
-            point_ids = self._annotator._point_prompt_ids[timestep]
+            if point_idx >= len(points):
+                return
             
-            # Extend list if needed
-            while len(point_ids) <= point_idx:
-                point_ids.append(1)
+            point = points[point_idx]
+            z, y, x = int(point[0]), int(point[1]), int(point[2])
             
-            # Update the ID
-            point_ids[point_idx] = new_id
-            self._annotator._point_prompt_ids[timestep] = point_ids
+            # Store ID using coordinates
+            self._annotator._set_point_id_from_coords(timestep, z, y, x, new_id)
             
-            # Update colors in the layer
-            if "point_prompts" in self._annotator._viewer.layers:
-                layer = self._annotator._viewer.layers["point_prompts"]
-                self._annotator._update_point_colors(layer, point_ids)
+            # Update colors for all points in the layer
+            all_point_ids = self._annotator._get_point_ids_for_timestep(timestep, points)
+            self._annotator._update_point_colors(layer, all_point_ids)
             
-            print(f"Updated point {point_idx} to ID {new_id}")
+            print(f"Updated point {point_idx} at ({z},{y},{x}) to ID {new_id}")
             
         except Exception as e:
             print(f"Failed to update point ID: {e}")
@@ -351,14 +337,92 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout()
         self.setLayout(layout)
 
-        btn_segment = QtWidgets.QPushButton("Segment All Timesteps")
-        btn_commit = QtWidgets.QPushButton("Commit All Timesteps")
+        btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
+        btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
 
         layout.addWidget(btn_segment)
         layout.addWidget(btn_commit)
+        
+        # Add copy point prompts UI
+        copy_label = QtWidgets.QLabel("Copy points from T:")
+        copy_row = QtWidgets.QWidget()
+        copy_layout = QtWidgets.QHBoxLayout()
+        copy_row.setLayout(copy_layout)
+        
+        self._copy_timestep_spinbox = QtWidgets.QSpinBox()
+        self._copy_timestep_spinbox.setMinimum(0)
+        self._copy_timestep_spinbox.setMaximum(999)
+        self._copy_timestep_spinbox.setValue(0)
+        self._copy_timestep_spinbox.setToolTip("Source timestep to copy points from")
+        
+        btn_copy_points = QtWidgets.QPushButton("Copy to Current T")
+        btn_copy_points.clicked.connect(self._copy_point_prompts)
+        
+        copy_layout.addWidget(copy_label)
+        copy_layout.addWidget(self._copy_timestep_spinbox)
+        copy_layout.addWidget(btn_copy_points)
+        
+        layout.addWidget(copy_row)
+    
+    def _copy_point_prompts(self):
+        """Copy point prompts from source timestep to current timestep."""
+        try:
+            source_t = int(self._copy_timestep_spinbox.value())
+            current_t = int(getattr(self._annotator, "current_timestep", 0) or 0)
+            
+            if source_t == current_t:
+                show_info("Source and current timestep are the same!")
+                return
+            
+            if source_t >= self._annotator.n_timesteps:
+                show_info(f"Source timestep {source_t} is out of range (max: {self._annotator.n_timesteps - 1})")
+                return
+            
+            # Get points from source timestep
+            if not hasattr(self._annotator, "point_prompts_4d"):
+                self._annotator.point_prompts_4d = {}
+            
+            source_points = self._annotator.point_prompts_4d.get(source_t, np.empty((0, 3)))
+            
+            if len(source_points) == 0:
+                show_info(f"No point prompts in timestep {source_t}")
+                return
+            
+            # Copy points to current timestep
+            copied_points = source_points.copy()
+            self._annotator.point_prompts_4d[current_t] = copied_points
+            
+            # Copy IDs based on coordinates
+            for point in source_points:
+                z, y, x = int(point[0]), int(point[1]), int(point[2])
+                source_id = self._annotator._get_point_id_from_coords(source_t, z, y, x)
+                self._annotator._set_point_id_from_coords(current_t, z, y, x, source_id)
+            
+            # Update the points layer
+            if "point_prompts" in self._annotator._viewer.layers:
+                layer = self._annotator._viewer.layers["point_prompts"]
+                if hasattr(layer, 'events') and hasattr(layer.events, 'data'):
+                    with layer.events.data.blocker():
+                        layer.data = copied_points
+                else:
+                    layer.data = copied_points
+                
+                # Update colors
+                point_ids = self._annotator._get_point_ids_for_timestep(current_t, copied_points)
+                self._annotator._update_point_colors(layer, point_ids)
+            
+            # Refresh point manager widget
+            if hasattr(self._annotator, "_point_manager_widget"):
+                self._annotator._point_manager_widget.refresh_point_list()
+            
+            show_info(f"Copied {len(copied_points)} point prompts from T={source_t} to T={current_t}")
+            
+        except Exception as e:
+            show_info(f"Failed to copy point prompts: {e}")
+            print(f"Error copying point prompts: {e}")
 
     def _safe_call(self, fn):
         try:
@@ -651,6 +715,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.current_object_4d = None
         # 4D-aware point prompts: dict mapping timestep -> points array
         self.point_prompts_4d = {}
+        # Persistent point-to-ID mapping: key=(t,z,y,x) -> value=ID
+        self.point_id_map = {}
         self.n_timesteps = 0
         # small per-timestep cache (optional)
         self._segmentation_cache = None
@@ -1116,14 +1182,8 @@ class MicroSAM4DAnnotator(Annotator3d):
             t = getattr(self, "current_timestep", 0)
             pts_t = np.array(self.point_prompts_4d.get(t, np.empty((0, 3))))
             
-            # Initialize point ID tracking
-            if not hasattr(self, "_point_prompt_ids"):
-                self._point_prompt_ids = {}  # Maps timestep -> list of IDs per point
-            if not hasattr(self, "_current_point_id"):
-                self._current_point_id = 1
-            
-            # Get point IDs for current timestep
-            point_ids = self._point_prompt_ids.get(t, [])
+            # Get point IDs based on coordinates
+            point_ids = self._get_point_ids_for_timestep(t, pts_t)
 
             # if layer exists, update its data
             if "point_prompts" in self._viewer.layers:
@@ -1188,36 +1248,22 @@ class MicroSAM4DAnnotator(Annotator3d):
             def _update_point_prompts(event=None):
                 # Get current timestep dynamically, not from closure
                 t_now = getattr(self, "current_timestep", 0)
+                if "point_prompts" not in self._viewer.layers:
+                    return
                 layer = self._viewer.layers["point_prompts"]
+                    
                 new_data = np.array(layer.data)
                 old_data = self.point_prompts_4d.get(t_now, np.empty((0, 3)))
                 
                 # Update point data
                 self.point_prompts_4d[t_now] = new_data
                 
-                # Track IDs for new points
-                if not hasattr(self, "_point_prompt_ids"):
-                    self._point_prompt_ids = {}
-                if t_now not in self._point_prompt_ids:
-                    self._point_prompt_ids[t_now] = []
+                # For new points (added), they get default ID 1 from _get_point_id_from_coords
+                # No need to explicitly track here - the coordinate-based map handles it
                 
-                current_ids = self._point_prompt_ids[t_now]
-                
-                # If points were added
-                if len(new_data) > len(old_data):
-                    # Assign default ID 1 to new points
-                    num_new = len(new_data) - len(old_data)
-                    for _ in range(num_new):
-                        current_ids.append(1)  # Default to ID 1
-                # If points were deleted
-                elif len(new_data) < len(old_data):
-                    # Remove corresponding IDs
-                    current_ids = current_ids[:len(new_data)]
-                
-                self._point_prompt_ids[t_now] = current_ids
-                
-                # Update colors based on IDs
-                self._update_point_colors(layer, current_ids)
+                # Update colors based on coordinate-based IDs
+                point_ids = self._get_point_ids_for_timestep(t_now, new_data)
+                self._update_point_colors(layer, point_ids)
                 
                 # Refresh point manager widget if it exists
                 if hasattr(self, "_point_manager_widget"):
@@ -1226,7 +1272,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                     except Exception:
                         pass
 
+            # Store reference and connect
+            self._point_prompt_connection = _update_point_prompts
             layer.events.data.connect(_update_point_prompts)
+            self._point_prompt_connection_setup = True
 
         except Exception as e:
             print(f"Error initializing 4D-aware point prompts: {e}")
@@ -1420,6 +1469,44 @@ class MicroSAM4DAnnotator(Annotator3d):
                 self.point_prompts_4d[t] = pts.copy() if pts.size else np.empty((0, 3))
             except Exception:
                 pass
+    
+    def _get_point_id_from_coords(self, t, z, y, x):
+        """Get the assigned ID for a point at given coordinates.
+        
+        Args:
+            t: timestep
+            z, y, x: point coordinates (rounded to int)
+            
+        Returns:
+            The assigned ID (default 1 if not found)
+        """
+        key = (int(t), int(z), int(y), int(x))
+        return self.point_id_map.get(key, 1)
+    
+    def _set_point_id_from_coords(self, t, z, y, x, point_id):
+        """Set the assigned ID for a point at given coordinates.
+        
+        Args:
+            t: timestep
+            z, y, x: point coordinates (rounded to int)
+            point_id: the ID to assign
+        """
+        key = (int(t), int(z), int(y), int(x))
+        self.point_id_map[key] = int(point_id)
+    
+    def _get_point_ids_for_timestep(self, t, points_array):
+        """Get IDs for all points in a timestep based on their coordinates.
+        
+        Args:
+            t: timestep
+            points_array: numpy array of shape (N, 3) with columns [z, y, x]
+            
+        Returns:
+            List of IDs for each point (default 1 if not found)
+        """
+        if len(points_array) == 0:
+            return []
+        return [self._get_point_id_from_coords(t, pt[0], pt[1], pt[2]) for pt in points_array]
     
     def _update_point_colors(self, layer, point_ids):
         """Update point colors based on their assigned IDs.
@@ -2209,11 +2296,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                 if not hasattr(self, "point_prompts_4d"):
                     self.point_prompts_4d = {}
                 self.point_prompts_4d[prev_t] = pts.copy() if pts.size else np.empty((0, 3))
-                
-                # Also persist point IDs
-                if hasattr(self, "_point_prompt_ids") and prev_t in self._point_prompt_ids:
-                    # IDs are already tracked in _point_prompt_ids
-                    pass
+                # Point IDs are already tracked in coordinate-based point_id_map
         except Exception as e:
             print(f"[WARN] Save point prompts failed: {e}")
 
@@ -2246,10 +2329,8 @@ class MicroSAM4DAnnotator(Annotator3d):
 
             new_pts = self.point_prompts_4d.get(new_t, np.empty((0, 3)))
             
-            # Get point IDs for this timestep
-            if not hasattr(self, "_point_prompt_ids"):
-                self._point_prompt_ids = {}
-            point_ids = self._point_prompt_ids.get(new_t, [])
+            # Get point IDs based on coordinates
+            point_ids = self._get_point_ids_for_timestep(new_t, new_pts)
 
             # if layer doesn't exist yet, create once
             if "point_prompts" not in self._viewer.layers:
@@ -2315,59 +2396,50 @@ class MicroSAM4DAnnotator(Annotator3d):
                     pass
             else:
                 layer = self._viewer.layers["point_prompts"]
-                layer.data = new_pts
+                # Update stored point data BEFORE updating layer to prevent callback confusion
+                self.point_prompts_4d[new_t] = new_pts
+                
+                # Block events when updating data to prevent ID reset
+                if hasattr(layer, 'events') and hasattr(layer.events, 'data'):
+                    with layer.events.data.blocker():
+                        layer.data = new_pts
+                else:
+                    layer.data = new_pts
                 # Update colors for the new timestep
                 self._update_point_colors(layer, point_ids)
 
-            # --- reconnect event listener cleanly ---
-            try:
-                if hasattr(self, "_point_prompt_connection"):
-                    layer.events.data.disconnect(self._point_prompt_connection)
-            except Exception:
-                pass
+            # --- setup event listener ONCE if not already connected ---
+            if not hasattr(self, "_point_prompt_connection_setup"):
+                try:
+                    def _update_points(event=None):
+                        t_now = getattr(self, "current_timestep", 0)
+                        if "point_prompts" not in self._viewer.layers:
+                            return
+                        layer = self._viewer.layers["point_prompts"]
+                        
+                        new_data = np.array(layer.data)
+                        
+                        # Update point data
+                        self.point_prompts_4d[t_now] = new_data
+                        
+                        # Get IDs based on coordinates (automatically handles new points with default ID 1)
+                        point_ids = self._get_point_ids_for_timestep(t_now, new_data)
+                        
+                        # Update colors based on IDs
+                        self._update_point_colors(layer, point_ids)
+                        
+                        # Refresh point manager widget if it exists
+                        if hasattr(self, "_point_manager_widget"):
+                            try:
+                                self._point_manager_widget.refresh_point_list()
+                            except Exception:
+                                pass
 
-            def _update_points(event=None):
-                t_now = getattr(self, "current_timestep", 0)
-                layer = self._viewer.layers["point_prompts"]
-                new_data = np.array(layer.data)
-                old_data = self.point_prompts_4d.get(t_now, np.empty((0, 3)))
-                
-                # Update point data
-                self.point_prompts_4d[t_now] = new_data
-                
-                # Track IDs for new points
-                if not hasattr(self, "_point_prompt_ids"):
-                    self._point_prompt_ids = {}
-                if t_now not in self._point_prompt_ids:
-                    self._point_prompt_ids[t_now] = []
-                
-                current_ids = self._point_prompt_ids[t_now]
-                
-                # If points were added
-                if len(new_data) > len(old_data):
-                    # Assign default ID 1 to new points
-                    num_new = len(new_data) - len(old_data)
-                    for _ in range(num_new):
-                        current_ids.append(1)  # Default to ID 1
-                # If points were deleted
-                elif len(new_data) < len(old_data):
-                    # Remove corresponding IDs
-                    current_ids = current_ids[:len(new_data)]
-                
-                self._point_prompt_ids[t_now] = current_ids
-                
-                # Update colors based on IDs
-                self._update_point_colors(layer, current_ids)
-                
-                # Refresh point manager widget if it exists
-                if hasattr(self, "_point_manager_widget"):
-                    try:
-                        self._point_manager_widget.refresh_point_list()
-                    except Exception:
-                        pass
-
-            self._point_prompt_connection = _update_points
-            layer.events.data.connect(self._point_prompt_connection)
+                    self._point_prompt_connection = _update_points
+                    layer.events.data.connect(self._point_prompt_connection)
+                    self._point_prompt_connection_setup = True
+                except Exception as e:
+                    print(f"[WARN] Failed to setup point prompt connection: {e}")
 
         except Exception as e:
             print(f"[WARN] Reload point prompts failed: {e}")
@@ -2917,6 +2989,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         # Remember original timestep to restore at the end
         original_t = getattr(self, "current_timestep", 0)
         original_pts = prompt_map.get(original_t, np.empty((0, 3)))
+        
+        print(f"🔄 Starting batch segmentation. Current timestep: {original_t}")
 
         # Disconnect point prompts event listener during batch segmentation to prevent interference
         if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
@@ -2933,15 +3007,32 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             seg_widget = None
 
+        # Disconnect dimension slider callback to prevent timestep change interference
+        dims_callback_disconnected = False
+        try:
+            self._viewer.dims.events.current_step.disconnect(self._on_dims_current_step)
+            dims_callback_disconnected = True
+        except Exception:
+            pass
+
         for t in range(int(self.n_timesteps)):
-            pts = prompt_map.get(t, np.empty((0, 3)))
+            # For current timestep, get points from the layer (may have unsaved points)
+            # For other timesteps, get from stored map
+            if t == original_t and point_layer is not None:
+                pts = np.array(point_layer.data)
+                print(f"📍 Processing CURRENT timestep {t} with {len(pts)} points from layer")
+            else:
+                pts = prompt_map.get(t, np.empty((0, 3)))
+                if len(pts) > 0:
+                    print(f"📍 Processing timestep {t} with {len(pts)} points from map")
+            
             pts_arr = np.asarray(pts) if pts is not None else np.empty((0, 3))
             if pts_arr.size == 0:
                 print(f"⏭️  Skipping timestep {t} - no point prompts")
                 continue
 
-            # Update current timestep internally without triggering full UI updates
-            self.current_timestep = int(t)
+            # DON'T update self.current_timestep to avoid triggering callbacks
+            # Just work with 't' directly for embedding activation
 
             # Run debug checks before attempting segmentation
             if not self.debug_segmentation_4d(t):
@@ -2965,11 +3056,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                         continue
                 
                 # Now ensure embeddings are active
-                if getattr(self, "timestep_embedding_manager", None) is not None:
+                # Skip embedding manager for current timestep as it's already active
+                if getattr(self, "timestep_embedding_manager", None) is not None and t != original_t:
                     try:
                         self.timestep_embedding_manager.on_timestep_changed(int(t))
                     except Exception:
                         pass
+                
+                # Ensure embeddings are active for this timestep
                 self._ensure_embeddings_active_for_t(int(t))
                 
                 # Verify embeddings are actually loaded in AnnotatorState
@@ -2994,7 +3088,12 @@ class MicroSAM4DAnnotator(Annotator3d):
             # Manually set point prompts for this timestep without triggering callbacks
             try:
                 if point_layer is not None:
-                    point_layer.data = pts_arr
+                    # Block events when updating data to prevent callback interference
+                    if hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
+                        with point_layer.events.data.blocker():
+                            point_layer.data = pts_arr
+                    else:
+                        point_layer.data = pts_arr
                 elif "point_prompts" not in self._viewer.layers:
                     point_layer = self._viewer.add_points(pts_arr, name="point_prompts", size=10,
                                                           face_color="green", edge_color="green",
@@ -3067,11 +3166,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                 # Initialize merged segmentation
                 seg_merged = np.zeros(shape, dtype=np.uint32)
                 
-                # Get point IDs for this timestep
-                point_ids = self._point_prompt_ids.get(t, [])
-                if len(point_ids) < len(pts_arr):
-                    # Fill missing IDs with sequential values
-                    point_ids.extend([i+1 for i in range(len(point_ids), len(pts_arr))])
+                # Get point IDs based on coordinates
+                point_ids = self._get_point_ids_for_timestep(t, pts_arr)
                 
                 # Convert point prompts to the format expected by prompt_segmentation
                 if len(pts_arr) > 0:
@@ -3221,11 +3317,18 @@ class MicroSAM4DAnnotator(Annotator3d):
                 traceback.print_exc()
                 continue
 
+        # Reconnect dimension slider callback
+        if dims_callback_disconnected:
+            try:
+                self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
+            except Exception:
+                pass
+
         # Restore original timestep and its point prompts
         try:
-            self.current_timestep = int(original_t)
-            if point_layer is not None:
-                point_layer.data = np.asarray(original_pts) if original_pts is not None else np.empty((0, 3))
+            # Use the proper API to restore timestep which will trigger _on_dims_current_step
+            # This will properly reload points with their IDs
+            self._viewer.dims.set_current_step(0, int(original_t))
         except Exception:
             pass
 
@@ -3243,7 +3346,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             pass
 
     def commit_all_timesteps(self):
-        """Transfer all non-empty `current_object_4d[t]` into `committed_objects_4d` using one new global ID."""
+        """Transfer all non-empty `current_object_4d[t]` into `committed_objects_4d` preserving their object IDs."""
         layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
         if layer is None:
             if self.segmentation_4d is None and self.image_4d is not None:
@@ -3259,12 +3362,11 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             pass
 
-        # Global max across all timesteps for uniqueness
+        # Get global max to offset new IDs if needed
         try:
             global_max = int(self.segmentation_4d.max()) if self.segmentation_4d is not None else 0
         except Exception:
             global_max = 0
-        new_id = int(global_max) + 1
 
         for t in range(int(self.n_timesteps)):
             if self.current_object_4d is None:
@@ -3276,20 +3378,27 @@ class MicroSAM4DAnnotator(Annotator3d):
             if seg_t is None or seg_t.size == 0 or not np.any(seg_t != 0):
                 continue
 
-            mask = seg_t != 0
-            try:
-                if hasattr(layer, "events") and hasattr(layer.events, "data"):
-                    with layer.events.data.blocker():
-                        layer.data[int(t)][mask] = new_id
-                else:
-                    layer.data[int(t)][mask] = new_id
-            except Exception:
+            # Get unique object IDs in this timestep
+            unique_ids = np.unique(seg_t[seg_t > 0])
+            
+            # Commit each object with its current ID (offset by global_max to avoid collisions)
+            for obj_id in unique_ids:
+                mask = seg_t == obj_id
+                new_id = int(global_max + obj_id)
+                
                 try:
-                    arr = np.asarray(layer.data[int(t)])
-                    arr[mask] = new_id
-                    layer.data[int(t)] = arr
+                    if hasattr(layer, "events") and hasattr(layer.events, "data"):
+                        with layer.events.data.blocker():
+                            layer.data[int(t)][mask] = new_id
+                    else:
+                        layer.data[int(t)][mask] = new_id
                 except Exception:
-                    pass
+                    try:
+                        arr = np.asarray(layer.data[int(t)])
+                        arr[mask] = new_id
+                        layer.data[int(t)] = arr
+                    except Exception:
+                        pass
 
             # Update local cache
             try:
