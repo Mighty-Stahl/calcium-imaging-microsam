@@ -366,6 +366,112 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         copy_layout.addWidget(btn_copy_points)
         
         layout.addWidget(copy_row)
+        
+        # Add crop object UI
+        crop_label = QtWidgets.QLabel("<b>Crop Object by Bounds:</b>")
+        layout.addWidget(crop_label)
+        
+        # Object ID to crop
+        id_row = QtWidgets.QWidget()
+        id_layout = QtWidgets.QHBoxLayout()
+        id_row.setLayout(id_layout)
+        id_layout.addWidget(QtWidgets.QLabel("Object ID:"))
+        self._crop_id_spinbox = QtWidgets.QSpinBox()
+        self._crop_id_spinbox.setMinimum(1)
+        self._crop_id_spinbox.setMaximum(9999)
+        self._crop_id_spinbox.setValue(1)
+        id_layout.addWidget(self._crop_id_spinbox)
+        layout.addWidget(id_row)
+        
+                # Z range
+        z_row = QtWidgets.QWidget()
+        z_layout = QtWidgets.QHBoxLayout()
+        z_row.setLayout(z_layout)
+        z_layout.addWidget(QtWidgets.QLabel("Z range:"))
+        self._crop_z_min = QtWidgets.QSpinBox()
+        self._crop_z_min.setMinimum(0)
+        self._crop_z_min.setMaximum(9999)
+        self._crop_z_min.setValue(0)
+        z_layout.addWidget(self._crop_z_min)
+        z_layout.addWidget(QtWidgets.QLabel("to"))
+        self._crop_z_max = QtWidgets.QSpinBox()
+        self._crop_z_max.setMinimum(0)
+        self._crop_z_max.setMaximum(9999)
+        self._crop_z_max.setValue(9999)
+        z_layout.addWidget(self._crop_z_max)
+        layout.addWidget(z_row)
+        
+        # Crop button
+        btn_crop = QtWidgets.QPushButton("Crop Object")
+        btn_crop.clicked.connect(self._crop_object)
+        layout.addWidget(btn_crop)
+    
+    def _crop_object(self):
+        """Crop an object in current_object_4d by Z axis bounds."""
+        try:
+            obj_id = int(self._crop_id_spinbox.value())
+            z_min = int(self._crop_z_min.value())
+            z_max = int(self._crop_z_max.value())
+            
+            if z_min > z_max:
+                show_info("Invalid Z range: min value must be <= max value")
+                return
+            
+            current_t = int(getattr(self._annotator, "current_timestep", 0) or 0)
+            
+            if self._annotator.current_object_4d is None:
+                show_info("No current objects to crop")
+                return
+            
+            # Get current timestep data
+            seg_t = self._annotator.current_object_4d[current_t]
+            
+            # Check if object ID exists
+            if not np.any(seg_t == obj_id):
+                show_info(f"Object ID {obj_id} not found in current timestep")
+                return
+            
+            # Create a mask for pixels to keep (within Z bounds)
+            shape = seg_t.shape  # (Z, Y, X)
+            
+            # Create Z coordinate grid
+            z_coords = np.arange(shape[0])[:, None, None]  # Shape (Z, 1, 1)
+            z_coords = np.broadcast_to(z_coords, shape)
+            
+            # Mask for pixels within Z bounds
+            in_bounds = (z_coords >= z_min) & (z_coords <= z_max)
+            
+            # Mask for this object
+            obj_mask = (seg_t == obj_id)
+            
+            # Pixels to remove: object pixels outside bounds
+            remove_mask = obj_mask & (~in_bounds)
+            
+            # Count pixels before and after
+            pixels_before = np.count_nonzero(obj_mask)
+            pixels_removed = np.count_nonzero(remove_mask)
+            pixels_after = pixels_before - pixels_removed
+            
+            if pixels_removed == 0:
+                show_info(f"Object ID {obj_id} is already within the specified bounds")
+                return
+            
+            # Remove pixels outside bounds
+            seg_t[remove_mask] = 0
+            
+            # Update the layer
+            if "current_object_4d" in self._annotator._viewer.layers:
+                layer = self._annotator._viewer.layers["current_object_4d"]
+                try:
+                    layer.refresh()
+                except Exception:
+                    pass
+            
+            show_info(f"Cropped object ID {obj_id}: removed {pixels_removed} pixels, kept {pixels_after} pixels")
+            
+        except Exception as e:
+            show_info(f"Failed to crop object: {e}")
+            print(f"Error cropping object: {e}")
     
     def _copy_point_prompts(self):
         """Copy point prompts from source timestep to current timestep."""
@@ -717,6 +823,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.point_prompts_4d = {}
         # Persistent point-to-ID mapping: key=(t,z,y,x) -> value=ID
         self.point_id_map = {}
+        # Counter for next point ID to assign
+        self.next_point_id = 1
         self.n_timesteps = 0
         # small per-timestep cache (optional)
         self._segmentation_cache = None
@@ -1255,11 +1363,16 @@ class MicroSAM4DAnnotator(Annotator3d):
                 new_data = np.array(layer.data)
                 old_data = self.point_prompts_4d.get(t_now, np.empty((0, 3)))
                 
+                # Detect new points and assign incrementing IDs
+                for pt in new_data:
+                    key = (int(t_now), int(pt[0]), int(pt[1]), int(pt[2]))
+                    if key not in self.point_id_map:
+                        # New point - assign next available ID
+                        self.point_id_map[key] = self.next_point_id
+                        self.next_point_id += 1
+                
                 # Update point data
                 self.point_prompts_4d[t_now] = new_data
-                
-                # For new points (added), they get default ID 1 from _get_point_id_from_coords
-                # No need to explicitly track here - the coordinate-based map handles it
                 
                 # Update colors based on coordinate-based IDs
                 point_ids = self._get_point_ids_for_timestep(t_now, new_data)
