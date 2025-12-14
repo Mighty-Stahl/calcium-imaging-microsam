@@ -1028,10 +1028,177 @@ class MicroSAM4DAnnotator(Annotator3d):
                 self._annotator_widget.layout().insertWidget(0, emb_widget)
             except Exception:
                 # fallback: add at end
+                self._annotator_widget.layout().addWidget(emb_widget)
+
+        except Exception as e:
+            print(f"Failed to create embeddings tools: {e}")
+
+        # Add POINT PROMPT TOOLS section
+        try:
+            point_widget = QtWidgets.QGroupBox("POINT PROMPT TOOLS")
+            point_widget.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    border: 2px solid #555;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                    color: #00bfff; 
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                }
+            """)
+            point_layout = QtWidgets.QVBoxLayout()
+            point_widget.setLayout(point_layout)
+
+            # Save and load buttons
+            save_load_row = QtWidgets.QWidget()
+            save_load_layout = QtWidgets.QHBoxLayout()
+            save_load_row.setLayout(save_load_layout)
+            btn_save_points = QtWidgets.QPushButton("Save point prompts")
+            btn_load_points = QtWidgets.QPushButton("Load point prompts")
+            save_load_layout.addWidget(btn_save_points)
+            save_load_layout.addWidget(btn_load_points)
+            point_layout.addWidget(save_load_row)
+
+            def _save_point_prompts():
                 try:
-                    self._annotator_widget.layout().addWidget(emb_widget)
-                except Exception:
-                    pass
+                    # Select directory to save point prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None, 
+                        "Select Directory to Save Point Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    save_path = Path(directory)
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save point prompts for each timestep that has them
+                    saved_count = 0
+                    for t in range(self.n_timesteps):
+                        points = self.point_prompts_4d.get(t, np.empty((0, 3)))
+                        if points is not None and len(points) > 0:
+                            # Save points coordinates
+                            points_file = save_path / f"point_prompts_{t}.npy"
+                            np.save(points_file, points)
+                            
+                            # Save point IDs for this timestep
+                            ids_for_timestep = []
+                            for point in points:
+                                z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                key = (t, z, y, x)
+                                point_id = self.point_id_map.get(key, 1)
+                                ids_for_timestep.append(point_id)
+                            
+                            ids_file = save_path / f"point_ids_{t}.npy"
+                            np.save(ids_file, np.array(ids_for_timestep))
+                            saved_count += 1
+                    
+                    if saved_count > 0:
+                        show_info(f"Saved point prompts for {saved_count} timestep(s) to {directory}")
+                    else:
+                        show_info("No point prompts to save")
+                    
+                except Exception as e:
+                    print(f"Failed to save point prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to save point prompts: {e}")
+
+            def _load_point_prompts():
+                try:
+                    # Select directory containing point prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None,
+                        "Select Directory Containing Point Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    directory_path = Path(directory)
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    
+                    # Clear existing point prompts
+                    self.point_prompts_4d.clear()
+                    self.point_id_map.clear()
+                    
+                    # Load point prompts for each timestep
+                    loaded_count = 0
+                    for t in range(self.n_timesteps):
+                        points_file = directory_path / f"point_prompts_{t}.npy"
+                        ids_file = directory_path / f"point_ids_{t}.npy"
+                        
+                        if points_file.exists():
+                            # Load points
+                            points = np.load(points_file)
+                            self.point_prompts_4d[t] = points
+                            
+                            # Load IDs if available
+                            if ids_file.exists():
+                                ids = np.load(ids_file)
+                                # Restore point_id_map
+                                for point, point_id in zip(points, ids):
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    self.point_id_map[key] = int(point_id)
+                            else:
+                                # Default to ID 1 if no IDs file
+                                for point in points:
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    self.point_id_map[key] = 1
+                            
+                            loaded_count += 1
+                    
+                    # Update current visible layer
+                    current_t = getattr(self, 'current_timestep', 0)
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+                        layer.data = points
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    if loaded_count > 0:
+                        show_info(f"Loaded point prompts for {loaded_count} timestep(s) from {directory}")
+                    else:
+                        show_info("No point prompts found in directory")
+                    
+                except Exception as e:
+                    print(f"Failed to load point prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to load point prompts: {e}")
+
+            btn_save_points.clicked.connect(_save_point_prompts)
+            btn_load_points.clicked.connect(_load_point_prompts)
+
+            # Insert the point prompt widget after embeddings widget
+            try:
+                self._annotator_widget.layout().insertWidget(1, point_widget)
+            except Exception:
+                # fallback: add at end
+                self._annotator_widget.layout().addWidget(point_widget)
+
+        except Exception as e:
+            print(f"Failed to create point prompt tools: {e}")
+
             # --- Remap points UI and Napari points layer ---
             try:
                 # create / reuse a Napari Points layer named 'remap_points' (3D coords)

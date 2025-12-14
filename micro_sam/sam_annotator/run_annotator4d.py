@@ -7,7 +7,7 @@ import numpy as np
 
 try:
     import napari
-except Exception:  # pragma: no cover - runtime environment dependent
+except Exception:  
     napari = None
 
 from micro_sam.sam_annotator.annotator_4d import MicroSAM4DAnnotator
