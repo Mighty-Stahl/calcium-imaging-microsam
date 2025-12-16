@@ -1199,6 +1199,99 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception as e:
             print(f"Failed to create point prompt tools: {e}")
 
+        # ================== SAVE SEGMENTATIONS ==================
+        try:
+            save_seg_widget = QtWidgets.QGroupBox("SAVE SEGMENTATIONS")
+            save_seg_widget.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    border: 2px solid #555;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                    color: #00ff88; 
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                }
+            """)
+            save_seg_layout = QtWidgets.QVBoxLayout()
+            save_seg_widget.setLayout(save_seg_layout)
+
+            # Save segmentation button
+            btn_save_seg = QtWidgets.QPushButton("💾 Save Segmentation")
+            btn_save_seg.setToolTip("Save raw image and committed segmentation masks to NPZ file")
+            
+            def _save_segmentation():
+                try:
+                    from qtpy.QtWidgets import QFileDialog
+                    
+                    # Ask user for save location
+                    filepath, _ = QFileDialog.getSaveFileName(
+                        self._viewer.window._qt_window,
+                        "Save Segmentation",
+                        str(Path.home() / "my_segmentation.npz"),
+                        "NumPy Archive (*.npz)"
+                    )
+                    
+                    if not filepath:
+                        return
+                    
+                    filepath = Path(filepath)
+                    if not filepath.suffix:
+                        filepath = filepath.with_suffix('.npz')
+                    
+                    # Check if we have data to save
+                    if self.image_4d is None:
+                        show_info("No image data to save")
+                        return
+                    
+                    if self.segmentation_4d is None:
+                        show_info("No segmentation to save. Commit objects first.")
+                        return
+                    
+                    # Save data
+                    print(f"Saving segmentation to {filepath}...")
+                    np.savez(
+                        filepath,
+                        image_4d=self.image_4d,                    # Raw calcium data (T,Z,Y,X)
+                        segmentation_4d=self.segmentation_4d,      # Committed segmentation (T,Z,Y,X)
+                        n_timesteps=self.n_timesteps,
+                        shape=self.image_4d.shape,
+                    )
+                    
+                    show_info(f"✅ Saved to {filepath.name}")
+                    print(f"✅ Saved segmentation successfully!")
+                    print(f"   - File: {filepath}")
+                    print(f"   - Image shape: {self.image_4d.shape}")
+                    print(f"   - Segmentation shape: {self.segmentation_4d.shape}")
+                    
+                    # Show unique neuron IDs
+                    unique_ids = np.unique(self.segmentation_4d)
+                    unique_ids = unique_ids[unique_ids > 0]  # Exclude background
+                    print(f"   - Neurons saved: {len(unique_ids)} (IDs: {unique_ids.tolist()})")
+                    
+                except Exception as e:
+                    print(f"❌ Failed to save segmentation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to save: {e}")
+            
+            btn_save_seg.clicked.connect(_save_segmentation)
+            save_seg_layout.addWidget(btn_save_seg)
+
+            # Insert the save segmentation widget after point prompt widget
+            try:
+                self._annotator_widget.layout().insertWidget(2, save_seg_widget)
+            except Exception:
+                # fallback: add at end
+                self._annotator_widget.layout().addWidget(save_seg_widget)
+
+        except Exception as e:
+            print(f"Failed to create save segmentation tools: {e}")
+
             # --- Remap points UI and Napari points layer ---
             try:
                 # create / reuse a Napari Points layer named 'remap_points' (3D coords)
@@ -3748,81 +3841,135 @@ class MicroSAM4DAnnotator(Annotator3d):
             return
         
         z_min, z_max = int(z_indices[0]), int(z_indices[-1])
-        print(f"    Processing Z-slices {z_min}-{z_max} using volumetric propagation")
+        print(f"    Initial Z-range: {z_min}-{z_max} (will expand dynamically if object moves in Z)")
         
         # Get state for predictor
         state = AnnotatorState()
         
-        # For each z-slice, propagate across time using volumetric segmentation
-        for z in range(z_min, z_max + 1):
-            mask_2d_anchor = mask_start[z]
+        # Track which Z-slices have been processed
+        processed_z_slices = set()
+        
+        # Iteratively process Z-slices, expanding range as object moves in Z
+        iteration = 0
+        max_iterations = 20  # Safety limit to prevent infinite loops
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"    Iteration {iteration}: Processing Z-range {z_min}-{z_max}")
             
-            if not mask_2d_anchor.any():
-                continue
+            # Collect Z-slices to process in this iteration
+            z_slices_to_process = []
+            for z in range(z_min, z_max + 1):
+                if z not in processed_z_slices:
+                    z_slices_to_process.append(z)
             
-            print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+            if not z_slices_to_process:
+                print(f"    All Z-slices processed, propagation complete")
+                break
             
-            try:
-                # Extract TYX embeddings for this z-slice
-                tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
-                if tyx_embeddings is None:
-                    print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+            # Process each new Z-slice
+            for z in z_slices_to_process:
+                # Check if this z-slice has mask at anchor or was populated in previous iteration
+                mask_2d_anchor = mask_start[z] if z < mask_start.shape[0] else np.zeros(mask_start.shape[1:], dtype=bool)
+                
+                has_mask = mask_2d_anchor.any()
+                if not has_mask:
+                    # Check if previous iteration added this object to this z-slice at any timestep
+                    for t in range(t_start, min(t_end + 1, self.n_timesteps)):
+                        if z < self.current_object_4d[t].shape[0] and (self.current_object_4d[t][z] == obj_id).any():
+                            has_mask = True
+                            mask_2d_anchor = (self.current_object_4d[t][z] == obj_id)
+                            break
+                
+                if not has_mask:
+                    processed_z_slices.add(z)
                     continue
                 
-                # Create TYX segmentation volume (T, Y, X)
-                # Initialize with zeros for all timesteps
-                image_shape = self.image_4d[0].shape  # (Z, Y, X)
-                y_size, x_size = image_shape[1], image_shape[2]
-                tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                print(f"      Z={z}: Propagating using segment_mask_in_volume...")
                 
-                # Set the anchor mask at t_start
-                tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
-                
-                # Check for other anchor timesteps with this object in this z-slice
-                anchor_timesteps = [t_start]
-                for t_check in range(self.n_timesteps):
-                    if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
-                        tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
-                        anchor_timesteps.append(t_check)
-                
-                # Use segment_mask_in_volume to propagate across time dimension
-                # The "segmented_slices" parameter is the anchor timestep(s)
-                print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
-                tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
-                    segmentation=tyx_seg,
-                    predictor=state.predictor,
-                    image_embeddings=tyx_embeddings,
-                    segmented_slices=np.array(anchor_timesteps),
-                    stop_lower=False,  # Propagate backward in time
-                    stop_upper=False,  # Propagate forward in time
-                    iou_threshold=0.5,
-                    projection="mask",  # Use mask projection
-                    verbose=False,
-                )
-                
-                print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
-                
-                # Write back to 4D volume: current_object_4d[:, z, :, :]
-                # Only write for timesteps between t_start and t_end
-                print(f"      Z={z}: Writing back results for timesteps {max(t_start, t_min)} to {min(t_end, t_max + 1) - 1}")
-                for t in range(max(t_start, t_min), min(t_end, t_max + 1)):
-                    if tyx_seg_result[t].any():
-                        # Only write where we have new segmentation
-                        mask_t = tyx_seg_result[t] > 0
-                        pixels_count = np.count_nonzero(mask_t)
-                        # Preserve this object's segmentation
-                        self.current_object_4d[t][z][mask_t] = obj_id
-                        print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
-                    else:
-                        print(f"      Z={z}: No pixels for t={t}")
-                
-                print(f"      Z={z}: Complete")
-                
-            except Exception as e:
-                print(f"      Z={z}: Error during propagation - {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                try:
+                    # Extract TYX embeddings for this z-slice
+                    tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                    if tyx_embeddings is None:
+                        print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                        processed_z_slices.add(z)
+                        continue
+                    
+                    # Create TYX segmentation volume (T, Y, X)
+                    # Initialize with zeros for all timesteps
+                    image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                    y_size, x_size = image_shape[1], image_shape[2]
+                    tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                    
+                    # Set the anchor mask at t_start
+                    tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
+                    
+                    # Check for other anchor timesteps with this object in this z-slice
+                    anchor_timesteps = [t_start]
+                    for t_check in range(self.n_timesteps):
+                        if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                            tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                            anchor_timesteps.append(t_check)
+                    
+                    # Use segment_mask_in_volume to propagate across time dimension
+                    # The "segmented_slices" parameter is the anchor timestep(s)
+                    print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                    tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                        segmentation=tyx_seg,
+                        predictor=state.predictor,
+                        image_embeddings=tyx_embeddings,
+                        segmented_slices=np.array(anchor_timesteps),
+                        stop_lower=False,  # Propagate backward in time
+                        stop_upper=False,  # Propagate forward in time
+                        iou_threshold=0.5,
+                        projection="mask",  # Use mask projection
+                        verbose=False,
+                    )
+                    
+                    print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                    
+                    # Write back to 4D volume: current_object_4d[:, z, :, :]
+                    # Only write for timesteps between t_start and t_end
+                    print(f"      Z={z}: Writing back results for timesteps {max(t_start, t_min)} to {min(t_end, t_max + 1) - 1}")
+                    for t in range(max(t_start, t_min), min(t_end, t_max + 1)):
+                        if tyx_seg_result[t].any():
+                            # Only write where we have new segmentation
+                            mask_t = tyx_seg_result[t] > 0
+                            pixels_count = np.count_nonzero(mask_t)
+                            # Preserve this object's segmentation
+                            self.current_object_4d[t][z][mask_t] = obj_id
+                            print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
+                        else:
+                            print(f"      Z={z}: No pixels for t={t}")
+                    
+                    print(f"      Z={z}: Complete")
+                    processed_z_slices.add(z)
+                    
+                except Exception as e:
+                    print(f"      Z={z}: Error during propagation - {e}")
+                    import traceback
+                    traceback.print_exc()
+                    processed_z_slices.add(z)
+                    continue
+            
+            # After processing all Z-slices in this iteration, check if object expanded to new Z-slices
+            new_z_min, new_z_max = z_min, z_max
+            for t in range(t_start, min(t_end + 1, self.n_timesteps)):
+                z_indices_t = np.where((self.current_object_4d[t] == obj_id).any(axis=(1, 2)))[0]
+                if len(z_indices_t) > 0:
+                    new_z_min = min(new_z_min, int(z_indices_t[0]))
+                    new_z_max = max(new_z_max, int(z_indices_t[-1]))
+            
+            if new_z_min < z_min or new_z_max > z_max:
+                print(f"    Object expanded in Z: {z_min}-{z_max} → {new_z_min}-{new_z_max}")
+                z_min, z_max = new_z_min, new_z_max
+            else:
+                # No expansion, we're done
+                print(f"    No Z expansion detected, propagation complete")
+                break
+        
+        if iteration >= max_iterations:
+            print(f"    Warning: Reached maximum iterations ({max_iterations}), stopping propagation")
         
         print(f"    Forward propagation complete")
 
@@ -3844,71 +3991,124 @@ class MicroSAM4DAnnotator(Annotator3d):
             return
         
         z_min, z_max = int(z_indices[0]), int(z_indices[-1])
-        print(f"    Processing Z-slices {z_min}-{z_max} using volumetric propagation")
+        print(f"    Initial Z-range: {z_min}-{z_max} (will expand dynamically if object moves in Z)")
         
         # Get state for predictor
         state = AnnotatorState()
         
-        # For each z-slice, propagate across time using volumetric segmentation
-        for z in range(z_min, z_max + 1):
-            mask_2d_anchor = mask_start[z]
+        # Track which Z-slices have been processed
+        processed_z_slices = set()
+        
+        # Iteratively process Z-slices, expanding range as object moves in Z
+        iteration = 0
+        max_iterations = 20  # Safety limit
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"    Iteration {iteration}: Processing Z-range {z_min}-{z_max}")
             
-            if not mask_2d_anchor.any():
-                continue
+            # Collect Z-slices to process in this iteration
+            z_slices_to_process = []
+            for z in range(z_min, z_max + 1):
+                if z not in processed_z_slices:
+                    z_slices_to_process.append(z)
             
-            print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+            if not z_slices_to_process:
+                print(f"    All Z-slices processed, propagation complete")
+                break
             
-            try:
-                # Extract TYX embeddings for this z-slice
-                tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
-                if tyx_embeddings is None:
-                    print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+            # For each z-slice, propagate across time using volumetric segmentation
+            for z in z_slices_to_process:
+                mask_2d_anchor = mask_start[z] if z < mask_start.shape[0] else np.zeros(mask_start.shape[1:], dtype=bool)
+                
+                has_mask = mask_2d_anchor.any()
+                if not has_mask:
+                    # Check if previous iteration added this object to this z-slice
+                    for t in range(t_end, min(t_start + 1, self.n_timesteps)):
+                        if z < self.current_object_4d[t].shape[0] and (self.current_object_4d[t][z] == obj_id).any():
+                            has_mask = True
+                            mask_2d_anchor = (self.current_object_4d[t][z] == obj_id)
+                            break
+                
+                if not has_mask:
+                    processed_z_slices.add(z)
                     continue
                 
-                # Create TYX segmentation volume (T, Y, X)
-                image_shape = self.image_4d[0].shape  # (Z, Y, X)
-                y_size, x_size = image_shape[1], image_shape[2]
-                tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                print(f"      Z={z}: Propagating using segment_mask_in_volume...")
                 
-                # Set the anchor mask at t_start
-                tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
-                
-                # Check for other anchor timesteps
-                anchor_timesteps = [t_start]
-                for t_check in range(self.n_timesteps):
-                    if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
-                        tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
-                        anchor_timesteps.append(t_check)
-                
-                # Use segment_mask_in_volume
-                print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
-                tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
-                    segmentation=tyx_seg,
-                    predictor=state.predictor,
-                    image_embeddings=tyx_embeddings,
-                    segmented_slices=np.array(anchor_timesteps),
-                    stop_lower=False,
-                    stop_upper=True,  # Don't propagate forward (already done)
-                    iou_threshold=0.5,
-                    projection="mask",
-                    verbose=False,
-                )
-                
-                print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
-                
-                # Write back to 4D volume for timesteps between t_end and t_start
-                for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
-                    if tyx_seg_result[t].any():
-                        mask_t = tyx_seg_result[t] > 0
-                        self.current_object_4d[t][z][mask_t] = obj_id
-                
-                print(f"      Z={z}: Complete")
-                
-            except Exception as e:
-                print(f"      Z={z}: Error during propagation - {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                try:
+                    # Extract TYX embeddings for this z-slice
+                    tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                    if tyx_embeddings is None:
+                        print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                        processed_z_slices.add(z)
+                        continue
+                    
+                    # Create TYX segmentation volume (T, Y, X)
+                    image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                    y_size, x_size = image_shape[1], image_shape[2]
+                    tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                    
+                    # Set the anchor mask at t_start
+                    tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
+                    
+                    # Check for other anchor timesteps
+                    anchor_timesteps = [t_start]
+                    for t_check in range(self.n_timesteps):
+                        if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                            tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                            anchor_timesteps.append(t_check)
+                    
+                    # Use segment_mask_in_volume
+                    print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                    tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                        segmentation=tyx_seg,
+                        predictor=state.predictor,
+                        image_embeddings=tyx_embeddings,
+                        segmented_slices=np.array(anchor_timesteps),
+                        stop_lower=False,
+                        stop_upper=True,  # Don't propagate forward (already done)
+                        iou_threshold=0.5,
+                        projection="mask",
+                        verbose=False,
+                    )
+                    
+                    print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                    
+                    # Write back to 4D volume for timesteps between t_end and t_start
+                    for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
+                        if tyx_seg_result[t].any():
+                            mask_t = tyx_seg_result[t] > 0
+                            self.current_object_4d[t][z][mask_t] = obj_id
+                    
+                    print(f"      Z={z}: Complete")
+                    processed_z_slices.add(z)
+                    
+                except Exception as e:
+                    print(f"      Z={z}: Error during propagation - {e}")
+                    import traceback
+                    traceback.print_exc()
+                    processed_z_slices.add(z)
+                    continue
+            
+            # After processing all Z-slices, check if object expanded to new Z-slices
+            new_z_min, new_z_max = z_min, z_max
+            for t in range(t_end, min(t_start + 1, self.n_timesteps)):
+                z_indices_t = np.where((self.current_object_4d[t] == obj_id).any(axis=(1, 2)))[0]
+                if len(z_indices_t) > 0:
+                    new_z_min = min(new_z_min, int(z_indices_t[0]))
+                    new_z_max = max(new_z_max, int(z_indices_t[-1]))
+            
+            if new_z_min < z_min or new_z_max > z_max:
+                print(f"    Object expanded in Z: {z_min}-{z_max} → {new_z_min}-{new_z_max}")
+                z_min, z_max = new_z_min, new_z_max
+            else:
+                # No expansion, we're done
+                print(f"    No Z expansion detected, propagation complete")
+                break
+        
+        if iteration >= max_iterations:
+            print(f"    Warning: Reached maximum iterations ({max_iterations}), stopping propagation")
         
         print(f"    Backward propagation complete")
 
