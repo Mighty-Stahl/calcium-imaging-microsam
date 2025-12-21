@@ -14,6 +14,8 @@ from .util import _load_amg_state, _load_is_state
 from . import util as _vutil
 from micro_sam.multi_dimensional_segmentation import automatic_3d_segmentation
 from skimage.transform import resize as _sk_resize
+from scipy.ndimage import distance_transform_edt, maximum_filter
+from skimage.segmentation import watershed
 
 class ObjectCommitWidget(QtWidgets.QWidget):
     """Widget to list current objects and commit them individually."""
@@ -1072,6 +1074,18 @@ class MicroSAM4DAnnotator(Annotator3d):
             neuropal_layout.addWidget(btn_load_neuropal)
             point_layout.addWidget(neuropal_row)
 
+            # Copy to all timesteps button (separate row)
+            copy_row = QtWidgets.QWidget()
+            copy_layout = QtWidgets.QHBoxLayout()
+            copy_row.setLayout(copy_layout)
+            btn_copy_all_t = QtWidgets.QPushButton("Copy Prompts to All Timesteps")
+            btn_copy_all_t.setToolTip(
+                "Copy current timestep's point prompts to all timesteps\n"
+                "Preserves IDs and coordinates"
+            )
+            copy_layout.addWidget(btn_copy_all_t)
+            point_layout.addWidget(copy_row)
+
             def _save_point_prompts():
                 try:
                     # Select directory to save point prompts
@@ -1229,7 +1243,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     print(f"  Intensity range: {image_3d.min():.0f} to {image_3d.max():.0f}")
                     
                     # Fixed percentile threshold
-                    percentile = 98.3
+                    percentile = 99
                     
                     # Find threshold
                     threshold = np.percentile(image_3d, percentile)
@@ -1238,9 +1252,23 @@ class MicroSAM4DAnnotator(Annotator3d):
                     # Create binary mask
                     bright_mask = image_3d > threshold
                     
-                    # Label connected regions
-                    labeled, num_features = label(bright_mask)
-                    print(f"  Found {num_features} bright regions")
+                    # Watershed separation to split touching neurons
+                    print("  Applying watershed separation for touching neurons...")
+                    
+                    distance = distance_transform_edt(bright_mask)
+                    
+              # Find local maxima as seeds
+                    local_max = maximum_filter(distance, size=5) == distance
+                    local_max[distance == 0] = False# 5% above threshold
+                    
+                    # Label seed regions
+                    markers, _ = label(local_max)
+                    
+                    # Watershed to separate touching regions
+                    labeled = watershed(-distance, markers, mask=bright_mask)
+                    num_features = labeled.max()
+                    
+                    print(f"  Found {num_features} regions after watershed separation")
                     
                     # Filter and get centroids
                     prompts = []
@@ -1362,6 +1390,77 @@ class MicroSAM4DAnnotator(Annotator3d):
                     show_info(f"❌ Error: {str(e)}")
 
             btn_auto_prompts.clicked.connect(_auto_place_prompts)
+
+            def _copy_prompts_to_all_timesteps():
+                """Copy current timestep's point prompts to all timesteps, preserving IDs."""
+                try:
+                    t_current = self.current_timestep
+                    
+                    # Get current prompts
+                    if "point_prompts" not in self._viewer.layers:
+                        show_info("⚠️ No point prompts in current timestep")
+                        return
+                    
+                    layer = self._viewer.layers["point_prompts"]
+                    current_prompts = np.array(layer.data)
+                    
+                    if len(current_prompts) == 0:
+                        show_info("⚠️ No point prompts to copy")
+                        return
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    
+                    # Get IDs from current timestep
+                    current_ids = []
+                    for point in current_prompts:
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        key = (t_current, z, y, x)
+                        point_id = self.point_id_map.get(key, 1)
+                        current_ids.append(point_id)
+                    
+                    # Copy prompts and IDs to all timesteps
+                    copied_count = 0
+                    for t in range(self.n_timesteps):
+                        if t == t_current:
+                            continue  # Skip current timestep
+                        
+                        # Store prompts
+                        self.point_prompts_4d[t] = current_prompts.copy()
+                        
+                        # Store IDs
+                        for point, point_id in zip(current_prompts, current_ids):
+                            z, y, x = int(point[0]), int(point[1]), int(point[2])
+                            key = (t, z, y, x)
+                            self.point_id_map[key] = point_id
+                        
+                        copied_count += 1
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    print(f"✅ Copied {len(current_prompts)} prompts to {copied_count} timesteps")
+                    show_info(
+                        f"✓ Copied {len(current_prompts)} prompts from timestep {t_current}\n"
+                        f"  to {copied_count} other timesteps\n\n"
+                        f"IDs preserved for temporal tracking.\n\n"
+                        f"Next: Click 'Segment Volume' to segment all timesteps"
+                    )
+                    
+                except Exception as e:
+                    print(f"Failed to copy prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+            
+            btn_copy_all_t.clicked.connect(_copy_prompts_to_all_timesteps)
 
             def _load_neuropal_prompts():
                 """Load NeuroPAL-derived point prompts with neuron names."""
