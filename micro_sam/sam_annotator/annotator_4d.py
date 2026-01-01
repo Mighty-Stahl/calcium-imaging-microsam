@@ -4901,6 +4901,15 @@ class MicroSAM4DAnnotator(Annotator3d):
                 traceback.print_exc()
                 continue
 
+        # Save the current timestep's segmentation before restoring (to preserve it)
+        original_t_seg = None
+        if self.current_object_4d is not None:
+            try:
+                original_t_seg = self.current_object_4d[int(original_t)].copy()
+                print(f"💾 Saved segmentation for original timestep {original_t}")
+            except Exception as e:
+                print(f"Warning: Could not save original timestep segmentation: {e}")
+
         # Reconnect dimension slider callback
         if dims_callback_disconnected:
             try:
@@ -4915,6 +4924,23 @@ class MicroSAM4DAnnotator(Annotator3d):
             self._viewer.dims.set_current_step(0, int(original_t))
         except Exception:
             pass
+
+        # Restore the segmentation for the original timestep (in case callback overwrote it)
+        if original_t_seg is not None and self.current_object_4d is not None:
+            try:
+                self.current_object_4d[int(original_t)] = original_t_seg
+                print(f"♻️  Restored segmentation for timestep {original_t}")
+            except Exception as e:
+                print(f"Warning: Could not restore original timestep segmentation: {e}")
+
+        # Force refresh of current_object_4d layer to show the segmentation
+        try:
+            lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
+            if lay is not None:
+                lay.refresh()
+                print(f"✅ Refreshed current_object_4d layer for restored timestep {original_t}")
+        except Exception as e:
+            print(f"Warning: Could not refresh current_object_4d layer: {e}")
 
         # Reconnect point prompts event listener
         if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):

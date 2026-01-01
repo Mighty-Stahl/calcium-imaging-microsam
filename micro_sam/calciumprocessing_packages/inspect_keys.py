@@ -1,16 +1,14 @@
+"""Essential first step to identify where calcium imaging 
+and NeuroPAL are stored respectively. 
+Different nwb files may have different keys, hence this is important. """
 from pynwb import NWBHDF5IO
 
-# io = NWBHDF5IO("/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz", "r")
-io = NWBHDF5IO("/Users/arnlois/000981/Hermaphrodites/sub-20220327-h4/sub-20220327-h4_ses-20220327_ophys.nwb", "r")
+io = NWBHDF5IO("/Users/arnlois/000981/Hermaphrodites/sub-20220327-h2/sub-20220327-h2_ses-20220327_ophys.nwb", "r")
 nwb = io.read()
 
-print("Processing modules:")
-print(nwb.processing.keys())
-
-print("\nAcquisition:")
 print(nwb.acquisition.keys())
+series = nwb.acquisition["CalciumImageSeries"]
 
-io.close()
+print("Rate:", series.rate)
+print("Data shape:", series.data.shape)
 
-
-#to find out where calcium traces are storeed (keys)

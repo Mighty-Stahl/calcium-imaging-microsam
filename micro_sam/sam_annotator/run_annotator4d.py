@@ -100,7 +100,7 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:4]
+    image4d = image4d[1:10]
     print(f"Trimmed: new shape = {image4d.shape}")
 
     # create Napari viewer and annotator

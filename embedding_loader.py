@@ -18,6 +18,7 @@ import zarr
 from tqdm import tqdm
 import sys
 
+# /Users/arnlois/data/code/cropped2_sub-20190928-13_ses-20190928_ophys_calcium.npz
 
 def load_image_data(filepath):
     """Load 4D image data from .npz or .npy file."""
@@ -125,8 +126,8 @@ def compute_embeddings(image_4d, output_path, input_path=None, model_type='vit_h
     for t in tqdm(range(start_t, end_t), desc="Timesteps", unit="t", ncols=80):
         image_3d = image_4d[t]  # (Z, Y, X)
         
-        # Create timestep-specific output path
-        timestep_path = output_path / f"t{t:04d}.zarr"
+        # Create timestep-specific output path (no zero-padding)
+        timestep_path = output_path / f"t{t}.zarr"
         
         # Compute embeddings for this timestep
         sam_util.precompute_image_embeddings(
@@ -144,7 +145,7 @@ def compute_embeddings(image_4d, output_path, input_path=None, model_type='vit_h
     print(f"{'='*60}")
     print(f"  Output directory: {output_path}")
     print(f"  Timesteps: {start_t} to {end_t-1}")
-    print(f"  Files: t{start_t:04d}.zarr to t{end_t-1:04d}.zarr")
+    print(f"  Files: t{start_t}.zarr to t{end_t-1}.zarr")
     print(f"\nTo use in annotator:")
     input_name = Path(input_path).name if input_path else 'your_data.npz'
     print(f"  1. Load image: {input_name}")
