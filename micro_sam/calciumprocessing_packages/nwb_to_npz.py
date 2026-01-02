@@ -9,7 +9,7 @@ from pynwb import NWBHDF5IO
 
 # ===== HARDCODED PARAMETERS - EDIT THESE =====
 NWB_PATH = "/Users/arnlois/000981/Hermaphrodites/sub-20220327-h2/sub-20220327-h2_ses-20220327_ophys.nwb"
-OUTPUT_PATH = "calcium_extracted.npz"
+OUTPUT_PATH = "calcium_extracted_gaussian.npz"
 
 fps = 2.67
 
@@ -22,10 +22,16 @@ response = 15  # seconds
 
 START_FRAME = int((stim_time - baseline) * fps)
 END_FRAME = int((stim_time + response) * fps)  # Set to None for all frames
-CHANNEL = 2  # 0 - RED, 1 - GREEN, 3 - BLUE
+CHANNEL = 1  # 0 - RED, 1 - GREEN, 3 - BLUE
 SERIES_NAME = "CalciumImageSeries"
 COMPRESS = True
 NORMALIZE = False
+
+# Gaussian filtering (noise reduction)
+APPLY_GAUSSIAN_FILTER = True  # Set to False to disable filtering
+GAUSSIAN_SIGMA_Z = 0.5  # Sigma for Z-axis smoothing (lower = less smoothing)
+GAUSSIAN_SIGMA_Y = 1.0  # Sigma for Y-axis smoothing
+GAUSSIAN_SIGMA_X = 1.0  # Sigma for X-axis smoothing
 # =============================================
 
 
@@ -38,6 +44,10 @@ def convert_nwb_to_npz(
     series_name: str = "CalciumImageSeries",
     compress: bool = True,
     normalize: bool = False,
+    apply_gaussian: bool = False,
+    sigma_z: float = 0.5,
+    sigma_y: float = 1.0,
+    sigma_x: float = 1.0,
 ):
     """Convert NWB calcium imaging to NPZ.
     
@@ -138,6 +148,14 @@ def convert_nwb_to_npz(
     print(f"  Final shape: {arr_tzyx.shape} (T, Z, Y, X)")
     print(f"  Dtype: {arr_tzyx.dtype}")
     
+    # Optional Gaussian filtering (noise reduction)
+    if apply_gaussian:
+        from scipy.ndimage import gaussian_filter
+        print(f"\nApplying Gaussian filter (sigma_z={sigma_z}, sigma_y={sigma_y}, sigma_x={sigma_x})...")
+        for t in range(arr_tzyx.shape[0]):
+            arr_tzyx[t] = gaussian_filter(arr_tzyx[t], sigma=(sigma_z, sigma_y, sigma_x))
+        print("  ✓ Gaussian filtering complete")
+    
     # Optional normalization
     if normalize:
         print("\nNormalizing (1-99 percentile)...")
@@ -180,6 +198,10 @@ def main():
         series_name=SERIES_NAME,
         compress=COMPRESS,
         normalize=NORMALIZE,
+        apply_gaussian=APPLY_GAUSSIAN_FILTER,
+        sigma_z=GAUSSIAN_SIGMA_Z,
+        sigma_y=GAUSSIAN_SIGMA_Y,
+        sigma_x=GAUSSIAN_SIGMA_X,
     )
 
 

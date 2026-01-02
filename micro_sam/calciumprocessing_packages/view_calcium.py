@@ -5,7 +5,7 @@ import numpy as np
 import napari
 
 # ===== HARDCODED PARAMETERS - EDIT THESE =====
-NPZ_PATH = "calcium_extracted1.npz"
+NPZ_PATH = "calcium_extracted_gaussian.npz"
 # =============================================
 
 def main():
