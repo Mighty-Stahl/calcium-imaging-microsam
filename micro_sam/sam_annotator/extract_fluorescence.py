@@ -5,7 +5,8 @@ Extract fluorescence traces from segmented neurons in NPZ files.
 Performs:
 1. Raw fluorescence extraction (mean intensity per neuron)
 2. Background subtraction (global per-frame)
-3. ΔF/F₀ normalization
+3. You should define pre-stimulus baseline to be used as Fo.
+4. ΔF/F₀ normalization
 
 Usage:
     python extract_fluorescence.py <path_to_segmentation.npz>
@@ -21,6 +22,30 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from scipy.signal import savgol_filter
+
+
+# ============================================================
+# SAVITZKY-GOLAY SMOOTHING CONFIGURATION
+# ============================================================
+APPLY_SAVGOL_SMOOTHING = True  # Set to False to disable smoothing
+SAVGOL_WINDOW_SIZE = 5          # Must be odd number (e.g., 3, 5, 7, 9)
+SAVGOL_POLYORDER = 2            # Polynomial order (must be < window_size)
+# ============================================================
+
+# ============================================================
+# BASELINE (F₀) CALCULATION METHOD
+# ============================================================
+BASELINE_METHOD = "percentile"  # Options: "percentile" or "pre_stimulus"
+
+# For percentile method:
+BASELINE_PERCENTILE = 10.0      # Percentile to use for F₀ (e.g., 10 = 10th percentile)
+
+# For pre-stimulus baseline method:
+BASELINE_START_FRAME = 0        # Start of baseline window (inclusive)
+BASELINE_END_FRAME = 10         # End of baseline window (exclusive)
+BASELINE_STAT = "median"        # Statistic to use: "mean", "median", or "min"
+# ============================================================
 
 
 def extract_raw_fluorescence(image_4d: np.ndarray, segmentation_4d: np.ndarray) -> dict:
@@ -103,49 +128,160 @@ def subtract_background(image_4d: np.ndarray, segmentation_4d: np.ndarray,
     return corrected_traces, background_trace
 
 
-def compute_dff(corrected_traces: dict, baseline_percentile: float = 10.0) -> dict:
+def compute_dff(corrected_traces: dict, method: str = "percentile", 
+                baseline_percentile: float = 10.0,
+                baseline_start: int = 0, baseline_end: int = 10,
+                baseline_stat: str = "median") -> dict:
     """Compute ΔF/F₀ normalization.
     
-    F₀ is computed as the baseline (10th percentile) of the corrected trace.
-    ΔF/F₀ = (F - F₀) / F₀
+    Two methods available:
+    1. Percentile: F₀ = percentile of entire trace (robust to outliers)
+    2. Pre-stimulus: F₀ = mean/median of baseline frames (e.g., before stimulus)
     
     Args:
         corrected_traces: Background-subtracted traces
-        baseline_percentile: Percentile to use for F₀ baseline (default: 10)
+        method: "percentile" or "pre_stimulus"
+        baseline_percentile: Percentile for F₀ if using percentile method (default: 10)
+        baseline_start: Start frame for baseline window if using pre_stimulus method
+        baseline_end: End frame (exclusive) for baseline window if using pre_stimulus method
+        baseline_stat: Statistic to use for pre_stimulus baseline: "mean", "median", or "min"
         
     Returns:
         Dictionary mapping neuron_id -> ΔF/F₀ trace
     """
     dff_traces = {}
     
-    print(f"\nComputing ΔF/F₀ (baseline = {baseline_percentile}th percentile)...")
+    print(f"\nComputing ΔF/F₀ using '{method}' method...")
     
     for neuron_id, trace in corrected_traces.items():
         # Remove NaN values for baseline calculation
-        valid_values = trace[~np.isnan(trace)]
+        valid_mask = ~np.isnan(trace)
+        valid_values = trace[valid_mask]
         
         if len(valid_values) == 0:
             dff_traces[neuron_id] = trace  # All NaN
+            print(f"  Neuron {neuron_id}: Skipped (all NaN values)")
             continue
         
-        # Compute F₀ as baseline (10th percentile)
-        f0 = np.percentile(valid_values, baseline_percentile)
+        # Compute F₀ based on method
+        if method == "percentile":
+            # Use percentile of entire trace
+            f0 = np.percentile(valid_values, baseline_percentile)
+            method_desc = f"{baseline_percentile}th percentile"
+            
+        elif method == "pre_stimulus":
+            # Use baseline frames only
+            baseline_frames = trace[baseline_start:baseline_end]
+            baseline_valid = baseline_frames[~np.isnan(baseline_frames)]
+            
+            if len(baseline_valid) == 0:
+                # Fallback to percentile if no valid baseline frames
+                f0 = np.percentile(valid_values, baseline_percentile)
+                method_desc = f"fallback to {baseline_percentile}th percentile (no valid baseline frames)"
+            else:
+                # Compute F₀ from baseline frames
+                if baseline_stat == "mean":
+                    f0 = np.mean(baseline_valid)
+                elif baseline_stat == "median":
+                    f0 = np.median(baseline_valid)
+                elif baseline_stat == "min":
+                    f0 = np.min(baseline_valid)
+                else:
+                    f0 = np.median(baseline_valid)  # Default to median
+                
+                method_desc = f"{baseline_stat} of frames {baseline_start}-{baseline_end}"
+        else:
+            # Invalid method - fallback to percentile
+            f0 = np.percentile(valid_values, baseline_percentile)
+            method_desc = f"fallback to {baseline_percentile}th percentile (invalid method)"
+            print(f"  Warning: Unknown method '{method}', using percentile")
         
         # Avoid division by zero
         if f0 <= 0:
             f0 = valid_values.mean() if valid_values.mean() > 0 else 1.0
+            method_desc += " (adjusted for zero baseline)"
         
         # Compute ΔF/F₀
         dff = (trace - f0) / f0
+        
+        # If using pre-stimulus method, set baseline frames to NaN (only analyze post-baseline)
+        if method == "pre_stimulus":
+            dff[:baseline_end] = np.nan
+            method_desc += f" (baseline frames {baseline_start}-{baseline_end} set to NaN)"
+        
         dff_traces[neuron_id] = dff
         
-        print(f"  Neuron {neuron_id}: F₀={f0:.2f}, ΔF/F₀ range=[{np.nanmin(dff):.3f}, {np.nanmax(dff):.3f}]")
+        print(f"  Neuron {neuron_id}: F₀={f0:.2f} ({method_desc}), ΔF/F₀ range=[{np.nanmin(dff):.3f}, {np.nanmax(dff):.3f}]")
     
     return dff_traces
 
 
+def apply_savgol_smoothing(dff_traces: dict, window_size: int = 5, polyorder: int = 2) -> dict:
+    """Apply Savitzky-Golay filter to smooth ΔF/F₀ traces.
+    
+    The Savitzky-Golay filter smooths data using a polynomial fit within a sliding window.
+    It preserves features like peaks better than simple moving averages.
+    
+    Args:
+        dff_traces: ΔF/F₀ traces to smooth
+        window_size: Length of filter window (must be odd). Larger = smoother but may lose detail.
+        polyorder: Order of polynomial to fit (must be < window_size). Usually 2 or 3.
+        
+    Returns:
+        Dictionary mapping neuron_id -> smoothed ΔF/F₀ trace
+    """
+    smoothed_traces = {}
+    
+    print(f"\nApplying Savitzky-Golay smoothing (window={window_size}, polyorder={polyorder})...")
+    
+    # Validate parameters
+    if window_size % 2 == 0:
+        print(f"  Warning: window_size must be odd, adjusting {window_size} -> {window_size + 1}")
+        window_size += 1
+    
+    if polyorder >= window_size:
+        print(f"  Warning: polyorder must be < window_size, adjusting to {window_size - 1}")
+        polyorder = window_size - 1
+    
+    for neuron_id, trace in dff_traces.items():
+        # Handle NaN values
+        valid_mask = ~np.isnan(trace)
+        
+        if np.sum(valid_mask) < window_size:
+            # Not enough valid points for smoothing
+            smoothed_traces[neuron_id] = trace.copy()
+            print(f"  Neuron {neuron_id}: Skipped (insufficient valid points)")
+            continue
+        
+        # Apply Savitzky-Golay filter
+        try:
+            smoothed = trace.copy()
+            valid_indices = np.where(valid_mask)[0]
+            
+            # Only smooth if we have a contiguous block of valid data
+            if len(valid_indices) == len(trace) and np.all(np.diff(valid_indices) == 1):
+                # Contiguous data - apply filter directly
+                smoothed = savgol_filter(trace, window_size, polyorder)
+            else:
+                # Sparse data - only smooth valid regions
+                # For simplicity, skip smoothing if data has gaps
+                print(f"  Neuron {neuron_id}: Skipped (data contains gaps/NaN values)")
+            
+            smoothed_traces[neuron_id] = smoothed
+            
+            # Show effect
+            noise_reduction = np.std(trace[valid_mask]) - np.std(smoothed[valid_mask])
+            print(f"  Neuron {neuron_id}: Noise reduced by {noise_reduction:.4f} std")
+            
+        except Exception as e:
+            print(f"  Neuron {neuron_id}: Failed to smooth ({e}), keeping original")
+            smoothed_traces[neuron_id] = trace.copy()
+    
+    return smoothed_traces
+
+
 def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict, 
-                background_trace: np.ndarray, output_path: Path = None):
+                background_trace: np.ndarray, smoothed_traces: dict = None, output_path: Path = None):
     """Plot all trace processing steps.
     
     Args:
@@ -153,6 +289,7 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
         corrected_traces: Background-subtracted traces
         dff_traces: ΔF/F₀ normalized traces
         background_trace: Per-frame background values
+        smoothed_traces: Optional Savitzky-Golay smoothed ΔF/F₀ traces
         output_path: Optional path to save figure
     """
     neuron_ids = sorted(raw_traces.keys())
@@ -161,13 +298,14 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     # ============================================================
     # ADJUST PLOT SIZE HERE (width, height in inches)
     # ============================================================
-    PLOT_WIDTH = 15          # Width of the figure (inches)
+    PLOT_WIDTH = 20 if smoothed_traces else 15  # Wider if showing smoothed traces
     ROW_HEIGHT = 2           # Height per neuron row (inches)
     # ============================================================
     
     # Create figure with subplots
+    n_cols = 4 if smoothed_traces else 3
     fig = plt.figure(figsize=(PLOT_WIDTH, ROW_HEIGHT * n_neurons + 2))
-    gs = GridSpec(n_neurons + 1, 3, figure=fig, hspace=0.4, wspace=0.3)
+    gs = GridSpec(n_neurons + 1, n_cols, figure=fig, hspace=0.4, wspace=0.3)
     
     # Plot background trace at the top
     ax_bg = fig.add_subplot(gs[0, :])
@@ -211,8 +349,24 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
         ax_dff.axhline(y=0, color='k', linestyle='--', alpha=0.3)
         if row == n_neurons:
             ax_dff.set_xlabel('Timepoint')
+        
+        # Smoothed ΔF/F₀ (if available)
+        if smoothed_traces:
+            ax_smooth = fig.add_subplot(gs[row, 3])
+            ax_smooth.plot(timepoints, smoothed_traces[neuron_id], 'm-', linewidth=1.5, label='Smoothed')
+            ax_smooth.plot(timepoints, dff_traces[neuron_id], 'r-', linewidth=0.5, alpha=0.3, label='Original')
+            ax_smooth.set_ylabel('ΔF/F₀')
+            ax_smooth.set_title(f'Neuron {neuron_id}: Smoothed', fontsize=10)
+            ax_smooth.grid(True, alpha=0.3)
+            ax_smooth.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+            ax_smooth.legend(fontsize=8)
+            if row == n_neurons:
+                ax_smooth.set_xlabel('Timepoint')
     
-    plt.suptitle('Fluorescence Trace Processing Pipeline', fontsize=14, fontweight='bold', y=0.995)
+    title = 'Fluorescence Trace Processing Pipeline'
+    if smoothed_traces:
+        title += ' (with Savitzky-Golay Smoothing)'
+    plt.suptitle(title, fontsize=14, fontweight='bold', y=0.995)
     
     # Save or show
     if output_path:
@@ -222,11 +376,12 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     plt.show()
 
 
-def plot_dff_only(dff_traces: dict, output_path: Path = None, neuron_names: dict = None):
+def plot_dff_only(dff_traces: dict, smoothed_traces: dict = None, output_path: Path = None, neuron_names: dict = None):
     """Plot only ΔF/F₀ traces for all neurons in a clean layout.
     
     Args:
         dff_traces: ΔF/F₀ normalized traces
+        smoothed_traces: Optional Savitzky-Golay smoothed traces to overlay
         output_path: Optional path to save figure
         neuron_names: Optional dict mapping neuron_id -> neuron_name
     """
@@ -258,7 +413,13 @@ def plot_dff_only(dff_traces: dict, output_path: Path = None, neuron_names: dict
             title = neuron_label
         
         # Plot trace
-        ax.plot(timepoints, trace, 'r-', linewidth=1.5, label=neuron_label)
+        if smoothed_traces and neuron_id in smoothed_traces:
+            # Show both original and smoothed
+            ax.plot(timepoints, trace, 'r-', linewidth=0.8, alpha=0.4, label=f'{neuron_label} (raw)')
+            ax.plot(timepoints, smoothed_traces[neuron_id], 'm-', linewidth=2, label=f'{neuron_label} (smoothed)')
+        else:
+            # Show only original
+            ax.plot(timepoints, trace, 'r-', linewidth=1.5, label=neuron_label)
         ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=0.8)
         
         # Styling
@@ -279,7 +440,10 @@ def plot_dff_only(dff_traces: dict, output_path: Path = None, neuron_names: dict
     axes[-1].set_xlabel('Timepoint', fontsize=11)
     
     # Overall title
-    fig.suptitle('ΔF/F₀ Fluorescence Traces', fontsize=14, fontweight='bold', y=0.995)
+    title = 'ΔF/F₀ Fluorescence Traces'
+    if smoothed_traces:
+        title += ' (with Savitzky-Golay Smoothing)'
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.995)
     
     plt.tight_layout()
     
@@ -292,7 +456,7 @@ def plot_dff_only(dff_traces: dict, output_path: Path = None, neuron_names: dict
 
 
 def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
-                background_trace: np.ndarray, output_path: Path):
+                background_trace: np.ndarray, smoothed_traces: dict = None, output_path: Path = None):
     """Save all traces to NPZ file.
     
     Args:
@@ -300,6 +464,7 @@ def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
         corrected_traces: Background-subtracted traces
         dff_traces: ΔF/F₀ traces
         background_trace: Global background trace
+        smoothed_traces: Optional Savitzky-Golay smoothed traces
         output_path: Path to save NPZ file
     """
     neuron_ids = sorted(raw_traces.keys())
@@ -309,25 +474,33 @@ def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     corrected_array = np.array([corrected_traces[nid] for nid in neuron_ids])
     dff_array = np.array([dff_traces[nid] for nid in neuron_ids])
     
-    np.savez(
-        output_path,
-        neuron_ids=np.array(neuron_ids),
-        raw_traces=raw_array,
-        corrected_traces=corrected_array,
-        dff_traces=dff_array,
-        background_trace=background_trace,
-    )
+    save_dict = {
+        'neuron_ids': np.array(neuron_ids),
+        'raw_traces': raw_array,
+        'corrected_traces': corrected_array,
+        'dff_traces': dff_array,
+        'background_trace': background_trace,
+    }
+    
+    if smoothed_traces:
+        smoothed_array = np.array([smoothed_traces[nid] for nid in neuron_ids])
+        save_dict['smoothed_traces'] = smoothed_array
+    
+    np.savez(output_path, **save_dict)
     
     print(f"\n💾 Traces saved to: {output_path}")
     print(f"   - neuron_ids: {neuron_ids}")
     print(f"   - raw_traces: {raw_array.shape}")
     print(f"   - corrected_traces: {corrected_array.shape}")
     print(f"   - dff_traces: {dff_array.shape}")
+    if smoothed_traces:
+        print(f"   - smoothed_traces: {smoothed_array.shape}")
     print(f"   - background_trace: {background_trace.shape}")
 
 
 def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
-                    background_trace: np.ndarray, output_path: Path, neuron_names: dict = None):
+                    background_trace: np.ndarray, smoothed_traces: dict = None, 
+                    output_path: Path = None, neuron_names: dict = None):
     """Save all traces to CSV files.
     
     Creates separate CSV files for each processing stage.
@@ -337,6 +510,7 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
         corrected_traces: Background-subtracted traces
         dff_traces: ΔF/F₀ traces
         background_trace: Global background trace
+        smoothed_traces: Optional Savitzky-Golay smoothed traces
         output_path: Base path for CSV files (will append suffixes)
         neuron_names: Optional dict mapping neuron_id -> neuron_name (e.g., {1: 'AVAL', 2: 'AVAR'})
     """
@@ -356,6 +530,7 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     raw_csv = f"{base_path}_raw.csv"
     corrected_csv = f"{base_path}_corrected.csv"
     dff_csv = f"{base_path}_dff.csv"
+    smoothed_csv = f"{base_path}_smoothed.csv"
     background_csv = f"{base_path}_background.csv"
     
     # Save raw traces
@@ -382,6 +557,15 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
             row = [t] + [dff_traces[nid][t] for nid in neuron_ids]
             writer.writerow(row)
     
+    # Save smoothed traces (if available)
+    if smoothed_traces:
+        with open(smoothed_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timepoint'] + headers)
+            for t in range(n_timesteps):
+                row = [t] + [smoothed_traces[nid][t] for nid in neuron_ids]
+                writer.writerow(row)
+    
     # Save background trace
     with open(background_csv, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -393,6 +577,8 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     print(f"   - Raw: {raw_csv}")
     print(f"   - Corrected: {corrected_csv}")
     print(f"   - ΔF/F₀: {dff_csv}")
+    if smoothed_traces:
+        print(f"   - Smoothed: {smoothed_csv}")
     print(f"   - Background: {background_csv}")
     if neuron_names:
         print(f"   ✓ Using neuron names: {list(neuron_names.values())}")
@@ -488,7 +674,21 @@ def process_segmentation_file(npz_path: str) -> int:
     )
     
     # ΔF/F₀ normalization
-    dff_traces = compute_dff(corrected_traces, baseline_percentile=10.0)
+    dff_traces = compute_dff(
+        corrected_traces, 
+        method=BASELINE_METHOD,
+        baseline_percentile=BASELINE_PERCENTILE,
+        baseline_start=BASELINE_START_FRAME,
+        baseline_end=BASELINE_END_FRAME,
+        baseline_stat=BASELINE_STAT
+    )
+    
+    # Optional: Savitzky-Golay smoothing
+    smoothed_traces = None
+    if APPLY_SAVGOL_SMOOTHING:
+        smoothed_traces = apply_savgol_smoothing(dff_traces, SAVGOL_WINDOW_SIZE, SAVGOL_POLYORDER)
+    else:
+        print("\n⏭️  Savitzky-Golay smoothing disabled (APPLY_SAVGOL_SMOOTHING = False)")
     
     # Prepare output paths
     output_dir = npz_path.parent / "fluorescence_traces"
@@ -503,17 +703,17 @@ def process_segmentation_file(npz_path: str) -> int:
     neuron_names = load_neuron_names(npz_path.parent)
     
     # Save traces (NPZ format)
-    save_traces(raw_traces, corrected_traces, dff_traces, background_trace, traces_path)
+    save_traces(raw_traces, corrected_traces, dff_traces, background_trace, smoothed_traces, traces_path)
     
     # Save traces (CSV format with neuron names if available)
-    save_traces_csv(raw_traces, corrected_traces, dff_traces, background_trace, csv_base_path, neuron_names)
+    save_traces_csv(raw_traces, corrected_traces, dff_traces, background_trace, smoothed_traces, csv_base_path, neuron_names)
     
     # Plot results - full pipeline
     print("\n📈 Generating plots...")
-    plot_traces(raw_traces, corrected_traces, dff_traces, background_trace, plot_path)
+    plot_traces(raw_traces, corrected_traces, dff_traces, background_trace, smoothed_traces, plot_path)
     
     # Plot results - ΔF/F₀ only (with neuron names if available)
-    plot_dff_only(dff_traces, dff_plot_path, neuron_names)
+    plot_dff_only(dff_traces, smoothed_traces, dff_plot_path, neuron_names)
     
     print("\n✅ Processing complete!")
     return 0
@@ -524,10 +724,10 @@ def main(argv=None):
     
     # ============================================================
     # SET YOUR FILE PATH HERE (or leave as None for file dialog)
-    # ============================================================
+    # ⭐️ ============================================================ ⭐️
     DEFAULT_FILE = "/Users/arnlois/data/code/saved_segmentations/my_segmentation.npz"
     # DEFAULT_FILE = None  # Uncomment this to use file dialog or command line
-    # ============================================================
+    # ⭐️ ============================================================ ⭐️
     
     parser = argparse.ArgumentParser(
         description="Extract fluorescence traces from segmented neurons",

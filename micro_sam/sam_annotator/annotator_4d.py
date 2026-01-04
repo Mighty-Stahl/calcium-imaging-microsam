@@ -14,7 +14,8 @@ from .util import _load_amg_state, _load_is_state
 from . import util as _vutil
 from micro_sam.multi_dimensional_segmentation import automatic_3d_segmentation
 from skimage.transform import resize as _sk_resize
-from scipy.ndimage import distance_transform_edt, maximum_filter
+from scipy.ndimage import distance_transform_edt, maximum_filter, label, center_of_mass
+from scipy.optimize import linear_sum_assignment
 from skimage.segmentation import watershed
 
 class ObjectCommitWidget(QtWidgets.QWidget):
@@ -357,14 +358,17 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
         btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
         btn_segment_propagate = QtWidgets.QPushButton("Segment + Propagate across time")
+        btn_propagate_points = QtWidgets.QPushButton("Propagate point prompts to all timesteps")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
         btn_segment_propagate.clicked.connect(lambda: self._safe_call(self._annotator.segment_and_propagate_all_timesteps))
+        btn_propagate_points.clicked.connect(lambda: self._safe_call(self._annotator.propagate_point_prompts_to_all_timesteps))
 
         layout.addWidget(btn_segment)
         layout.addWidget(btn_segment_propagate)
         layout.addWidget(btn_commit)
+        layout.addWidget(btn_propagate_points)
         
         # Add copy point prompts UI
         copy_label = QtWidgets.QLabel("Copy points from T:")
@@ -5067,3 +5071,437 @@ class MicroSAM4DAnnotator(Annotator3d):
                     pass
         except Exception:
             pass
+
+    def propagate_point_prompts_to_all_timesteps(self):
+        """Intelligently propagate point prompts across all timesteps.
+        
+        For each timestep:
+        1. Copy point locations from previous timestep
+        2. Move each point to local intensity maximum within search radius
+        3. If point lands in background (black), assign to nearest unprompted neuron blob
+        4. Preserve point IDs across timesteps for consistent tracking
+        """
+        if self.image_4d is None or self.n_timesteps is None:
+            show_info("No 4D image data loaded")
+            return
+        
+        # Get current timestep to use as anchor
+        current_t = int(getattr(self, "current_timestep", 0) or 0)
+        
+        # Check if current timestep has point prompts
+        if not hasattr(self, "point_prompts_4d"):
+            self.point_prompts_4d = {}
+        
+        # Get points from current layer (most up-to-date)
+        if "point_prompts" in self._viewer.layers:
+            current_points = np.array(self._viewer.layers["point_prompts"].data)
+        else:
+            current_points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+        
+        if len(current_points) == 0:
+            show_info(f"No point prompts in current timestep {current_t}. Please add points first.")
+            return
+        
+        # Store current points with their IDs
+        self.point_prompts_4d[current_t] = current_points.copy()
+        
+        # Get point IDs for current timestep
+        current_ids = self._get_point_ids_for_timestep(current_t, current_points)
+        
+        # Search radius for local maxima (in pixels)
+        SEARCH_RADIUS = 7
+        
+        # Intensity threshold percentile (below this is considered background)
+        BACKGROUND_THRESHOLD_PERCENTILE = 50
+        
+        print(f"🔄 Propagating {len(current_points)} points from timestep {current_t} to all {self.n_timesteps} timesteps")
+        
+        # Forward propagation (current_t -> end)
+        for t in range(current_t + 1, int(self.n_timesteps)):
+            self._propagate_points_to_timestep(
+                t, t - 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+            )
+        
+        # Backward propagation (current_t -> start)
+        for t in range(current_t - 1, -1, -1):
+            self._propagate_points_to_timestep(
+                t, t + 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+            )
+        
+        # Update viewer to show propagated points
+        self._update_viewer_after_propagation(current_t)
+        
+        total_points = sum(len(pts) for pts in self.point_prompts_4d.values())
+        show_info(f"✅ Propagated points to all timesteps! Total points: {total_points}")
+    
+    def _propagate_points_to_timestep(self, target_t, source_t, search_radius, threshold_percentile):
+        """Propagate points from source_t to target_t using Hungarian algorithm for optimal matching."""
+        # Get source points
+        source_points = self.point_prompts_4d.get(source_t, np.empty((0, 3)))
+        if len(source_points) == 0:
+            return
+        
+        # Get 3D image for target timestep
+        image_3d = self.image_4d[int(target_t)]
+        
+        # Calculate threshold for background detection
+        nonzero_values = image_3d[image_3d > 0]
+        if len(nonzero_values) > 0:
+            threshold = np.percentile(nonzero_values, threshold_percentile)
+        else:
+            threshold = 0
+        
+        # Create binary mask of foreground regions
+        foreground_mask = image_3d > threshold
+        
+        # Label connected components in foreground
+        labeled_blobs, num_blobs = label(foreground_mask)
+        
+        if num_blobs == 0:
+            # No blobs found - keep points at original positions
+            self.point_prompts_4d[target_t] = source_points.copy()
+            point_ids = self._get_point_ids_for_timestep(source_t, source_points)
+            for idx, point in enumerate(source_points):
+                point_id = point_ids[idx] if idx < len(point_ids) else (idx + 1)
+                z, y, x = int(point[0]), int(point[1]), int(point[2])
+                self._set_point_id_from_coords(target_t, z, y, x, point_id)
+            return
+        
+        # Get blob centroids and properties
+        blob_centroids = {}
+        blob_sizes = {}
+        blob_intensities = {}
+        
+        for blob_id in range(1, num_blobs + 1):
+            blob_mask = labeled_blobs == blob_id
+            if np.any(blob_mask):
+                # Centroid
+                centroid = center_of_mass(blob_mask)
+                blob_centroids[blob_id] = np.array(centroid)
+                
+                # Size (number of pixels)
+                blob_sizes[blob_id] = np.sum(blob_mask)
+                
+                # Average intensity
+                blob_intensities[blob_id] = np.mean(image_3d[blob_mask])
+        
+        # Get point IDs
+        point_ids = self._get_point_ids_for_timestep(source_t, source_points)
+        
+        # Get source image to determine which blob each point was on
+        image_3d_source = self.image_4d[int(source_t)]
+        foreground_mask_source = image_3d_source > threshold
+        labeled_blobs_source, _ = label(foreground_mask_source)
+        
+        # Step 1: Find candidate blobs for each point (local maximum search)
+        # IMPORTANT: Constrain search to same blob to prevent jumping between neurons
+        point_candidates = []  # List of dict with point_idx, blob_id, position, etc.
+        
+        for idx, point in enumerate(source_points):
+            z, y, x = int(point[0]), int(point[1]), int(point[2])
+            
+            # Determine which blob this point was on in source frame
+            source_blob_id = labeled_blobs_source[z, y, x] if z < labeled_blobs_source.shape[0] else 0
+            
+            # Find local maximum, preferring to stay within the same blob
+            new_z, new_y, new_x, stayed_in_blob = self._find_local_maximum_in_blob(
+                image_3d, labeled_blobs, z, y, x, search_radius, source_blob_id
+            )
+            
+            # Get blob at new position
+            blob_id = labeled_blobs[new_z, new_y, new_x]
+            
+            if blob_id > 0:
+                # Point lands on a blob
+                distance = np.sqrt((new_z - z)**2 + (new_y - y)**2 + (new_x - x)**2)
+                intensity = image_3d[new_z, new_y, new_x]
+                point_candidates.append({
+                    'point_idx': idx,
+                    'blob_id': blob_id,
+                    'position': (new_z, new_y, new_x),
+                    'distance': distance,
+                    'intensity': intensity,
+                    'original_pos': (z, y, x)
+                })
+            else:
+                # Point lands in background - find nearest blob
+                nearest_blob, nearest_dist = self._find_nearest_blob(
+                    blob_centroids, z, y, x
+                )
+                if nearest_blob is not None:
+                    centroid = blob_centroids[nearest_blob]
+                    cz, cy, cx = int(centroid[0]), int(centroid[1]), int(centroid[2])
+                    point_candidates.append({
+                        'point_idx': idx,
+                        'blob_id': nearest_blob,
+                        'position': (cz, cy, cx),
+                        'distance': nearest_dist,
+                        'intensity': blob_intensities[nearest_blob],
+                        'original_pos': (z, y, x)
+                    })
+                else:
+                    # No blobs available - will handle later
+                    point_candidates.append({
+                        'point_idx': idx,
+                        'blob_id': None,
+                        'position': (z, y, x),
+                        'distance': 0,
+                        'intensity': 0,
+                        'original_pos': (z, y, x)
+                    })
+        
+        # Step 2: Use Hungarian algorithm for optimal point-to-blob assignment
+        assignments = self._hungarian_match_points_to_blobs(
+            point_candidates, blob_centroids, source_points
+        )
+        
+        # Step 3: Apply assignments and update point prompts
+        propagated_points = []
+        for idx, assignment in enumerate(assignments):
+            point_id = point_ids[idx] if idx < len(point_ids) else (idx + 1)
+            z, y, x = assignment['position']
+            propagated_points.append([z, y, x])
+            self._set_point_id_from_coords(target_t, z, y, x, point_id)
+        
+        # Store propagated points
+        self.point_prompts_4d[target_t] = np.array(propagated_points)
+    
+    def _hungarian_match_points_to_blobs(self, point_candidates, blob_centroids, source_points):
+        """Use Hungarian algorithm to optimally assign points to blobs.
+        
+        This prevents:
+        - Multiple points clustering on the same blob
+        - Points disappearing when greedy matching fails
+        - Incorrect neuron assignments
+        """
+        n_points = len(source_points)
+        unique_blobs = set(c['blob_id'] for c in point_candidates if c['blob_id'] is not None)
+        
+        if len(unique_blobs) == 0:
+            # No blobs available - keep original positions
+            return point_candidates
+        
+        # Build list of all blobs (including duplicates from candidates)
+        all_blobs = list(unique_blobs)
+        n_blobs = len(all_blobs)
+        
+        # If more points than blobs, add dummy blobs (points will keep original positions)
+        if n_points > n_blobs:
+            n_blobs = n_points
+            all_blobs.extend([None] * (n_points - len(all_blobs)))
+        
+        # Create cost matrix: cost[point_idx, blob_idx]
+        # Lower cost = better match
+        cost_matrix = np.zeros((n_points, n_blobs))
+        LARGE_COST = 1e6
+        
+        for i, candidate in enumerate(point_candidates):
+            for j, blob_id in enumerate(all_blobs):
+                if blob_id is None:
+                    # Dummy blob - high cost (only use if no real blob available)
+                    cost_matrix[i, j] = LARGE_COST
+                elif candidate['blob_id'] == blob_id:
+                    # This is the candidate blob for this point - use distance as cost
+                    cost_matrix[i, j] = candidate['distance']
+                elif blob_id in blob_centroids:
+                    # Alternative blob - compute distance from original position
+                    orig_z, orig_y, orig_x = candidate['original_pos']
+                    centroid = blob_centroids[blob_id]
+                    distance = np.sqrt(
+                        (centroid[0] - orig_z)**2 +
+                        (centroid[1] - orig_y)**2 +
+                        (centroid[2] - orig_x)**2
+                    )
+                    # Penalize alternative blobs slightly to prefer original candidates
+                    cost_matrix[i, j] = distance * 1.2
+                else:
+                    cost_matrix[i, j] = LARGE_COST
+        
+        # Run Hungarian algorithm
+        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        
+        # Build final assignments
+        assignments = []
+        for point_idx, blob_idx in zip(row_indices, col_indices):
+            assigned_blob = all_blobs[blob_idx]
+            
+            if assigned_blob is None or cost_matrix[point_idx, blob_idx] >= LARGE_COST:
+                # No good blob match - keep original position
+                orig_pos = point_candidates[point_idx]['original_pos']
+                assignments.append({
+                    'position': orig_pos,
+                    'blob_id': None
+                })
+            elif assigned_blob == point_candidates[point_idx]['blob_id']:
+                # Matched to candidate blob - use candidate position
+                assignments.append(point_candidates[point_idx])
+            else:
+                # Matched to alternative blob - use its centroid
+                centroid = blob_centroids[assigned_blob]
+                cz, cy, cx = int(centroid[0]), int(centroid[1]), int(centroid[2])
+                assignments.append({
+                    'position': (cz, cy, cx),
+                    'blob_id': assigned_blob
+                })
+        
+        return assignments
+    
+    def _find_nearest_blob(self, blob_centroids, z, y, x):
+        """Find the nearest blob centroid to position (z, y, x).
+        
+        Returns:
+            (blob_id, distance) or (None, inf) if no blobs
+        """
+        min_distance = float('inf')
+        nearest_blob = None
+        
+        for blob_id, centroid in blob_centroids.items():
+            distance = np.sqrt(
+                (centroid[0] - z)**2 +
+                (centroid[1] - y)**2 +
+                (centroid[2] - x)**2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_blob = blob_id
+        
+        return nearest_blob, min_distance
+    
+    def _find_local_maximum(self, image_3d, z, y, x, radius):
+        """Find local intensity maximum within radius of (z, y, x).
+        
+        Returns the brightest pixel within the search radius.
+        Note: This does NOT constrain to a specific blob - blob filtering
+        happens in the Hungarian matching step.
+        """
+        shape = image_3d.shape
+        
+        # Define search box
+        z_min = max(0, z - radius)
+        z_max = min(shape[0], z + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(shape[1], y + radius + 1)
+        x_min = max(0, x - radius)
+        x_max = min(shape[2], x + radius + 1)
+        
+        # Extract neighborhood
+        neighborhood = image_3d[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        # Find maximum within neighborhood
+        max_idx = np.unravel_index(np.argmax(neighborhood), neighborhood.shape)
+        
+        # Convert back to global coordinates
+        new_z = z_min + max_idx[0]
+        new_y = y_min + max_idx[1]
+        new_x = x_min + max_idx[2]
+        
+        return new_z, new_y, new_x
+    
+    def _find_local_maximum_in_blob(self, image_3d, labeled_blobs, z, y, x, radius, current_blob_id):
+        """Find local intensity maximum within radius, constrained to the same blob.
+        
+        Args:
+            image_3d: 3D intensity image
+            labeled_blobs: Labeled blob array from scipy.ndimage.label
+            z, y, x: Current position
+            radius: Search radius
+            current_blob_id: Blob ID to constrain search to (0 means unconstrained)
+            
+        Returns:
+            (new_z, new_y, new_x, found_in_same_blob)
+        """
+        shape = image_3d.shape
+        
+        # Define search box
+        z_min = max(0, z - radius)
+        z_max = min(shape[0], z + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(shape[1], y + radius + 1)
+        x_min = max(0, x - radius)
+        x_max = min(shape[2], x + radius + 1)
+        
+        # Extract neighborhood
+        neighborhood = image_3d[z_min:z_max, y_min:y_max, x_min:x_max]
+        blob_neighborhood = labeled_blobs[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        if current_blob_id > 0:
+            # First try to find maximum within the same blob
+            same_blob_mask = blob_neighborhood == current_blob_id
+            if np.any(same_blob_mask):
+                # Extract only pixels from the same blob
+                blob_intensities = neighborhood[same_blob_mask]
+                
+                # Find maximum intensity within same blob
+                max_intensity = np.max(blob_intensities)
+                
+                # Find position of this maximum in the neighborhood
+                max_positions = np.where((neighborhood == max_intensity) & same_blob_mask)
+                
+                # Use first occurrence if multiple maxima
+                max_idx = (max_positions[0][0], max_positions[1][0], max_positions[2][0])
+                
+                new_z = int(z_min + max_idx[0])
+                new_y = int(y_min + max_idx[1])
+                new_x = int(x_min + max_idx[2])
+                
+                return new_z, new_y, new_x, True
+        
+        # If no constraint or blob not found, search globally
+        max_idx = np.unravel_index(np.argmax(neighborhood), neighborhood.shape)
+        
+        new_z = int(z_min + max_idx[0])
+        new_y = int(y_min + max_idx[1])
+        new_x = int(x_min + max_idx[2])
+        
+        return new_z, new_y, new_x, False
+    
+    def _find_nearest_unprompted_blob(self, labeled_blobs, blob_has_point, z, y, x, num_blobs):
+        """Find centroid of nearest blob that doesn't have a point yet."""
+        if num_blobs == 0:
+            return None
+        
+        # Get centroids of all blobs
+        from scipy.ndimage import center_of_mass
+        
+        # Find unprompted blobs
+        unprompted_blobs = []
+        for blob_id in range(1, num_blobs + 1):
+            if blob_id not in blob_has_point:
+                blob_mask = labeled_blobs == blob_id
+                if np.any(blob_mask):
+                    centroid = center_of_mass(blob_mask)
+                    unprompted_blobs.append((blob_id, centroid))
+        
+        if len(unprompted_blobs) == 0:
+            return None
+        
+        # Find nearest unprompted blob
+        min_distance = float('inf')
+        nearest_centroid = None
+        
+        for blob_id, (cz, cy, cx) in unprompted_blobs:
+            distance = np.sqrt((cz - z)**2 + (cy - y)**2 + (cx - x)**2)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_centroid = (int(cz), int(cy), int(cx))
+        
+        return nearest_centroid
+    
+    def _update_viewer_after_propagation(self, current_t):
+        """Update viewer to show propagated points for current timestep."""
+        if "point_prompts" in self._viewer.layers:
+            # Get points for current timestep
+            current_points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+            
+            # Update layer
+            layer = self._viewer.layers["point_prompts"]
+            layer.data = current_points
+            
+            # Update colors based on IDs
+            if len(current_points) > 0:
+                point_ids = self._get_point_ids_for_timestep(current_t, current_points)
+                self._update_point_colors(layer, point_ids)
+        
+        # Refresh point manager if available
+        if hasattr(self, "_point_manager_widget"):
+            self._point_manager_widget.refresh_point_list()
