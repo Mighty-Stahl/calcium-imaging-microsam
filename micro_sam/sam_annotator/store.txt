@@ -14,6 +14,9 @@ from .util import _load_amg_state, _load_is_state
 from . import util as _vutil
 from micro_sam.multi_dimensional_segmentation import automatic_3d_segmentation
 from skimage.transform import resize as _sk_resize
+from scipy.ndimage import distance_transform_edt, maximum_filter, label, center_of_mass
+from scipy.optimize import linear_sum_assignment
+from skimage.segmentation import watershed
 
 class ObjectCommitWidget(QtWidgets.QWidget):
     """Widget to list current objects and commit them individually."""
@@ -106,16 +109,22 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             print(f"Failed to add object entry: {e}")
     
     def _commit_single_object(self, obj_id: int, timestep: int):
-        """Commit a single object ID from current_object_4d to committed_objects_4d."""
+        """Commit a single object ID from ALL timesteps in current_object_4d to committed_objects_4d."""
         try:
             if self._annotator.current_object_4d is None:
                 show_info("No current objects to commit")
                 return
             
-            # Get mask for this specific object
-            mask = self._annotator.current_object_4d[timestep] == obj_id
-            if not np.any(mask):
-                show_info(f"Object ID {obj_id} not found in timestep {timestep}")
+            # Check if object exists in ANY timestep
+            n_timesteps = self._annotator.n_timesteps
+            found_in_any = False
+            for t in range(n_timesteps):
+                if np.any(self._annotator.current_object_4d[t] == obj_id):
+                    found_in_any = True
+                    break
+            
+            if not found_in_any:
+                show_info(f"Object ID {obj_id} not found in any timestep")
                 return
             
             # Ensure committed_objects_4d exists
@@ -126,39 +135,48 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             max_id = int(self._annotator.segmentation_4d.max())
             new_id = max_id + 1
             
-            # Copy this object to committed layer
-            self._annotator.segmentation_4d[timestep][mask] = new_id
+            # Copy this object from ALL timesteps to committed layer
+            timesteps_committed = []
+            for t in range(n_timesteps):
+                mask = self._annotator.current_object_4d[t] == obj_id
+                if np.any(mask):
+                    self._annotator.segmentation_4d[t][mask] = new_id
+                    self._annotator.current_object_4d[t][mask] = 0
+                    timesteps_committed.append(t)
             
-            # Remove from current_object_4d
-            self._annotator.current_object_4d[timestep][mask] = 0
-            
-            # Remove point prompts associated with this object ID
+            # Remove point prompts associated with this object ID from ALL timesteps
+            total_prompts_removed = 0
             try:
-                if "point_prompts" in self._annotator._viewer.layers:
+                # Remove from all timesteps where this object exists
+                for t in timesteps_committed:
+                    # Remove from point_prompts_4d storage
+                    if hasattr(self._annotator, 'point_prompts_4d') and t in self._annotator.point_prompts_4d:
+                        pts = self._annotator.point_prompts_4d[t]
+                        if pts is not None and len(pts) > 0:
+                            point_ids = self._annotator._get_point_ids_for_timestep(t, pts)
+                            points_to_keep = []
+                            for point, pid in zip(pts, point_ids):
+                                if pid != obj_id:
+                                    points_to_keep.append(point)
+                                else:
+                                    # Remove from coordinate map
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    if key in self._annotator.point_id_map:
+                                        del self._annotator.point_id_map[key]
+                                    total_prompts_removed += 1
+                            
+                            self._annotator.point_prompts_4d[t] = np.array(points_to_keep) if points_to_keep else np.empty((0, 3))
+                
+                # Also update current visible layer if on a committed timestep
+                current_t = getattr(self._annotator, 'current_timestep', 0)
+                if current_t in timesteps_committed and "point_prompts" in self._annotator._viewer.layers:
                     layer = self._annotator._viewer.layers["point_prompts"]
-                    points = np.array(layer.data)
-                    
-                    # Get IDs for all points
-                    point_ids = self._annotator._get_point_ids_for_timestep(timestep, points)
-                    
-                    # Find points with this object ID and remove them
-                    points_to_keep = []
-                    for idx, (point, pid) in enumerate(zip(points, point_ids)):
-                        if pid != obj_id:
-                            points_to_keep.append(point)
-                        else:
-                            # Remove from coordinate map
-                            z, y, x = int(point[0]), int(point[1]), int(point[2])
-                            key = (timestep, z, y, x)
-                            if key in self._annotator.point_id_map:
-                                del self._annotator.point_id_map[key]
-                    
-                    if len(points_to_keep) < len(points):
-                        # Update layer and stored data
-                        new_points = np.array(points_to_keep) if points_to_keep else np.empty((0, 3))
-                        layer.data = new_points
-                        self._annotator.point_prompts_4d[timestep] = new_points
-                        print(f"Removed {len(points) - len(points_to_keep)} point prompt(s) for object ID {obj_id}")
+                    pts = self._annotator.point_prompts_4d.get(current_t, np.empty((0, 3)))
+                    layer.data = pts
+                
+                if total_prompts_removed > 0:
+                    print(f"Removed {total_prompts_removed} point prompt(s) for object ID {obj_id} across {len(timesteps_committed)} timestep(s)")
             except Exception as e:
                 print(f"Warning: Could not remove point prompts: {e}")
             
@@ -174,7 +192,7 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             except Exception:
                 pass
             
-            show_info(f"Committed object ID {obj_id} as new ID {new_id}")
+            show_info(f"Committed object ID {obj_id} as new ID {new_id} across {len(timesteps_committed)} timestep(s)")
             
             # Refresh both the object list and point list
             self.refresh_object_list()
@@ -340,14 +358,20 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
         btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
         btn_segment_propagate = QtWidgets.QPushButton("Segment + Propagate across time")
+        btn_propagate_points = QtWidgets.QPushButton("Propagate point prompts to all timesteps")
+        btn_propagate_segmentation = QtWidgets.QPushButton("Propagate Current Segmentation")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
         btn_segment_propagate.clicked.connect(lambda: self._safe_call(self._annotator.segment_and_propagate_all_timesteps))
+        btn_propagate_points.clicked.connect(lambda: self._safe_call(self._annotator.propagate_point_prompts_to_all_timesteps))
+        btn_propagate_segmentation.clicked.connect(lambda: self._safe_call(self._annotator.propagate_current_segmentation))
 
         layout.addWidget(btn_segment)
         layout.addWidget(btn_segment_propagate)
         layout.addWidget(btn_commit)
+        layout.addWidget(btn_propagate_points)
+        layout.addWidget(btn_propagate_segmentation)
         
         # Add copy point prompts UI
         copy_label = QtWidgets.QLabel("Copy points from T:")
@@ -1013,10 +1037,700 @@ class MicroSAM4DAnnotator(Annotator3d):
                 self._annotator_widget.layout().insertWidget(0, emb_widget)
             except Exception:
                 # fallback: add at end
+                self._annotator_widget.layout().addWidget(emb_widget)
+
+        except Exception as e:
+            print(f"Failed to create embeddings tools: {e}")
+
+        # Add POINT PROMPT TOOLS section
+        try:
+            point_widget = QtWidgets.QGroupBox("POINT PROMPT TOOLS")
+            point_widget.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    border: 2px solid #555;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                    color: #00bfff; 
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                }
+            """)
+            point_layout = QtWidgets.QVBoxLayout()
+            point_widget.setLayout(point_layout)
+
+            # Save and load buttons
+            save_load_row = QtWidgets.QWidget()
+            save_load_layout = QtWidgets.QHBoxLayout()
+            save_load_row.setLayout(save_load_layout)
+            btn_save_points = QtWidgets.QPushButton("Save point prompts")
+            btn_load_points = QtWidgets.QPushButton("Load point prompts")
+            save_load_layout.addWidget(btn_save_points)
+            save_load_layout.addWidget(btn_load_points)
+            point_layout.addWidget(save_load_row)
+
+            # NeuroPAL prompts button (separate row)
+            neuropal_row = QtWidgets.QWidget()
+            neuropal_layout = QtWidgets.QHBoxLayout()
+            neuropal_row.setLayout(neuropal_layout)
+            btn_load_neuropal = QtWidgets.QPushButton("Load NeuroPAL Prompts")
+            neuropal_layout.addWidget(btn_load_neuropal)
+            point_layout.addWidget(neuropal_row)
+
+            # Copy to all timesteps button (separate row)
+            copy_row = QtWidgets.QWidget()
+            copy_layout = QtWidgets.QHBoxLayout()
+            copy_row.setLayout(copy_layout)
+            btn_copy_all_t = QtWidgets.QPushButton("Copy Prompts to All Timesteps")
+            btn_copy_all_t.setToolTip(
+                "Copy current timestep's point prompts to all timesteps\n"
+                "Preserves IDs and coordinates"
+            )
+            copy_layout.addWidget(btn_copy_all_t)
+            point_layout.addWidget(copy_row)
+
+            def _save_point_prompts():
                 try:
-                    self._annotator_widget.layout().addWidget(emb_widget)
-                except Exception:
-                    pass
+                    # Select directory to save point prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None, 
+                        "Select Directory to Save Point Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    save_path = Path(directory)
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save point prompts for each timestep that has them
+                    saved_count = 0
+                    for t in range(self.n_timesteps):
+                        points = self.point_prompts_4d.get(t, np.empty((0, 3)))
+                        if points is not None and len(points) > 0:
+                            # Save points coordinates
+                            points_file = save_path / f"point_prompts_{t}.npy"
+                            np.save(points_file, points)
+                            
+                            # Save point IDs for this timestep
+                            ids_for_timestep = []
+                            for point in points:
+                                z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                key = (t, z, y, x)
+                                point_id = self.point_id_map.get(key, 1)
+                                ids_for_timestep.append(point_id)
+                            
+                            ids_file = save_path / f"point_ids_{t}.npy"
+                            np.save(ids_file, np.array(ids_for_timestep))
+                            saved_count += 1
+                    
+                    if saved_count > 0:
+                        show_info(f"Saved point prompts for {saved_count} timestep(s) to {directory}")
+                    else:
+                        show_info("No point prompts to save")
+                    
+                except Exception as e:
+                    print(f"Failed to save point prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to save point prompts: {e}")
+
+            def _load_point_prompts():
+                try:
+                    # Select directory containing point prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None,
+                        "Select Directory Containing Point Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    directory_path = Path(directory)
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    
+                    # Clear existing point prompts
+                    self.point_prompts_4d.clear()
+                    self.point_id_map.clear()
+                    
+                    # Load point prompts for each timestep
+                    loaded_count = 0
+                    for t in range(self.n_timesteps):
+                        points_file = directory_path / f"point_prompts_{t}.npy"
+                        ids_file = directory_path / f"point_ids_{t}.npy"
+                        
+                        if points_file.exists():
+                            # Load points
+                            points = np.load(points_file)
+                            self.point_prompts_4d[t] = points
+                            
+                            # Load IDs if available
+                            if ids_file.exists():
+                                ids = np.load(ids_file)
+                                # Restore point_id_map
+                                for point, point_id in zip(points, ids):
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    self.point_id_map[key] = int(point_id)
+                            else:
+                                # Default to ID 1 if no IDs file
+                                for point in points:
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    self.point_id_map[key] = 1
+                            
+                            loaded_count += 1
+                    
+                    # Update current visible layer
+                    current_t = getattr(self, 'current_timestep', 0)
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+                        layer.data = points
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    if loaded_count > 0:
+                        show_info(f"Loaded point prompts for {loaded_count} timestep(s) from {directory}")
+                    else:
+                        show_info("No point prompts found in directory")
+                    
+                except Exception as e:
+                    print(f"Failed to load point prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to load point prompts: {e}")
+
+            btn_save_points.clicked.connect(_save_point_prompts)
+            btn_load_points.clicked.connect(_load_point_prompts)
+
+            # Auto-place prompts button (separate row)
+            auto_row = QtWidgets.QWidget()
+            auto_layout = QtWidgets.QHBoxLayout()
+            auto_row.setLayout(auto_layout)
+            btn_auto_prompts = QtWidgets.QPushButton("Auto-Place Prompts")
+            btn_auto_prompts.setToolTip(
+                "Automatically place prompts at bright spots (intensity-based)\n"
+                "Works on raw image, no GPU needed, runs in <1 second"
+            )
+            auto_layout.addWidget(btn_auto_prompts)
+            point_layout.addWidget(auto_row)
+
+            def _auto_place_prompts():
+                """Automatically place point prompts at bright spots based on intensity."""
+                try:
+                    from scipy.ndimage import center_of_mass, label
+                    
+                    # Get current timestep image
+                    t = self.current_timestep
+                    if self.image_4d is None:
+                        show_info("⚠️ No image loaded. Load data first.")
+                        return
+                    
+                    image_3d = self.image_4d[t]  # (Z, Y, X)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"🔍 Auto-detecting neurons at timestep {t}")
+                    print(f"{'='*60}")
+                    print(f"  Image shape: {image_3d.shape}")
+                    print(f"  Intensity range: {image_3d.min():.0f} to {image_3d.max():.0f}")
+                    
+                    # Fixed percentile threshold
+                    percentile = 99
+                    
+                    # Find threshold
+                    threshold = np.percentile(image_3d, percentile)
+                    print(f"  Threshold ({percentile}th percentile): {threshold:.0f}")
+                    
+                    # Create binary mask
+                    bright_mask = image_3d > threshold
+                    
+                    # Watershed separation to split touching neurons
+                    print("  Applying watershed separation for touching neurons...")
+                    
+                    distance = distance_transform_edt(bright_mask)
+                    
+              # Find local maxima as seeds
+                    local_max = maximum_filter(distance, size=5) == distance
+                    local_max[distance == 0] = False# 5% above threshold
+                    
+                    # Label seed regions
+                    markers, _ = label(local_max)
+                    
+                    # Watershed to separate touching regions
+                    labeled = watershed(-distance, markers, mask=bright_mask)
+                    num_features = labeled.max()
+                    
+                    print(f"  Found {num_features} regions after watershed separation")
+                    
+                    # Filter and get centroids
+                    prompts = []
+                    skipped_small = 0
+                    skipped_large = 0
+                    
+                    for region_id in range(1, num_features + 1):
+                        region_mask = labeled == region_id
+                        size = np.sum(region_mask)
+                        
+                        # Skip tiny regions (noise) - reduced from 10 to 5
+                        if size < 5:  # pixels
+                            skipped_small += 1
+                            continue
+                        
+                        # Skip huge regions (background artifacts)
+                        if size > 10000:
+                            print(f"    Skipping region {region_id}: too large ({size} px)")
+                            skipped_large += 1
+                            continue
+                        
+                        # Get centroid
+                        z, y, x = center_of_mass(region_mask)
+                        prompts.append([z, y, x])
+                        print(f"    ✓ Region {region_id}: size={size} px, center=({z:.1f}, {y:.1f}, {x:.1f})")
+                    
+                    if skipped_small > 0:
+                        print(f"  (Skipped {skipped_small} tiny regions < 5 pixels)")
+                    if skipped_large > 0:
+                        print(f"  (Skipped {skipped_large} large regions > 10000 pixels)")
+                    
+                    prompts = np.array(prompts)
+                    
+                    if len(prompts) == 0:
+                        show_info(
+                            f"⚠️ No bright spots found with threshold={threshold:.0f}\n\n"
+                            f"Try:\n"
+                            f"• Click button again and use LOWER percentile (e.g., 98.0)\n"
+                            f"• Check if neurons are visible in viewer\n"
+                            f"• Adjust image contrast\n\n"
+                            f"Current settings:\n"
+                            f"  Percentile: {percentile}\n"
+                            f"  Threshold: {threshold:.0f}\n"
+                            f"  Regions found: {num_features}\n"
+                            f"  After filtering: 0"
+                        )
+                        print("  ⚠️ No valid regions found after filtering")
+                        return
+                    
+                    print(f"\n  📍 Placing {len(prompts)} prompts...")
+                    
+                    # Add to point_prompts layer
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        existing = np.array(layer.data) if len(layer.data) > 0 else np.empty((0, 3))
+                        # Append to existing prompts
+                        if len(existing) > 0:
+                            prompts = np.vstack([existing, prompts])
+                            print(f"  Added to {len(existing)} existing prompts")
+                        layer.data = prompts
+                        layer.visible = True
+                    else:
+                        layer = self._viewer.add_points(
+                            prompts,
+                            name="point_prompts",
+                            size=10,
+                            face_color='orange',
+                            edge_color='white',
+                            edge_width=2,
+                            ndim=3
+                        )
+                    
+                    # Store in 4D map
+                    self.point_prompts_4d[t] = prompts
+                    
+                    # Assign IDs (sequential starting from current max ID)
+                    existing_ids = list(self.point_id_map.values()) if hasattr(self, 'point_id_map') and self.point_id_map else [0]
+                    start_id = max(existing_ids) + 1 if existing_ids else 1
+                    
+                    for i, point in enumerate(prompts):
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        point_id = start_id + i
+                        self.point_id_map[(t, z, y, x)] = point_id
+                    
+                    # Update colors
+                    point_ids = self._get_point_ids_for_timestep(t, prompts)
+                    self._update_point_colors(layer, point_ids)
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    print(f"{'='*60}")
+                    print(f"✅ Auto-placed {len(prompts)} prompts successfully!")
+                    print(f"{'='*60}\n")
+                    
+                    show_info(
+                        f"✓ Auto-placed {len(prompts)} prompts\n\n"
+                        f"Settings used:\n"
+                        f"  Percentile: {percentile}\n"
+                        f"  Threshold: {threshold:.0f}\n"
+                        f"  Regions found: {num_features}\n"
+                        f"  Valid prompts: {len(prompts)}\n\n"
+                        f"Too few? Click again and use LOWER percentile (e.g., 98.0)\n"
+                        f"Too many? Click again and use HIGHER percentile (e.g., 99.5)\n\n"
+                        f"Next: Click 'Segment Volume' to segment all neurons"
+                    )
+                    
+                except ImportError as e:
+                    show_info(f"⚠️ Missing dependency: {e}\n\nInstall scipy: pip install scipy")
+                    print(f"Failed to auto-place prompts: {e}")
+                except Exception as e:
+                    print(f"Failed to auto-place prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+
+            btn_auto_prompts.clicked.connect(_auto_place_prompts)
+
+            def _copy_prompts_to_all_timesteps():
+                """Copy current timestep's point prompts to all timesteps, preserving IDs."""
+                try:
+                    t_current = self.current_timestep
+                    
+                    # Get current prompts
+                    if "point_prompts" not in self._viewer.layers:
+                        show_info("⚠️ No point prompts in current timestep")
+                        return
+                    
+                    layer = self._viewer.layers["point_prompts"]
+                    current_prompts = np.array(layer.data)
+                    
+                    if len(current_prompts) == 0:
+                        show_info("⚠️ No point prompts to copy")
+                        return
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    
+                    # Get IDs from current timestep
+                    current_ids = []
+                    for point in current_prompts:
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        key = (t_current, z, y, x)
+                        point_id = self.point_id_map.get(key, 1)
+                        current_ids.append(point_id)
+                    
+                    # Copy prompts and IDs to all timesteps
+                    copied_count = 0
+                    for t in range(self.n_timesteps):
+                        if t == t_current:
+                            continue  # Skip current timestep
+                        
+                        # Store prompts
+                        self.point_prompts_4d[t] = current_prompts.copy()
+                        
+                        # Store IDs
+                        for point, point_id in zip(current_prompts, current_ids):
+                            z, y, x = int(point[0]), int(point[1]), int(point[2])
+                            key = (t, z, y, x)
+                            self.point_id_map[key] = point_id
+                        
+                        copied_count += 1
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    print(f"✅ Copied {len(current_prompts)} prompts to {copied_count} timesteps")
+                    show_info(
+                        f"✓ Copied {len(current_prompts)} prompts from timestep {t_current}\n"
+                        f"  to {copied_count} other timesteps\n\n"
+                        f"IDs preserved for temporal tracking.\n\n"
+                        f"Next: Click 'Segment Volume' to segment all timesteps"
+                    )
+                    
+                except Exception as e:
+                    print(f"Failed to copy prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+            
+            btn_copy_all_t.clicked.connect(_copy_prompts_to_all_timesteps)
+
+            def _load_neuropal_prompts():
+                """Load NeuroPAL-derived point prompts with neuron names."""
+                try:
+                    from pathlib import Path
+                    import sys
+                    
+                    # Add NeuroPAL matching folder to path
+                    neuropal_path = Path(__file__).parent.parent / "Neuropal Coordinate Matching"
+                    if str(neuropal_path) not in sys.path:
+                        sys.path.insert(0, str(neuropal_path))
+                    
+                    from load_neuropal_prompts import load_neuropal_prompts, create_neuron_name_layer_data  # type: ignore
+                    
+                    # Select directory containing NeuroPAL prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None,
+                        "Select Directory Containing NeuroPAL Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    # Load prompts for timestep 0
+                    result = load_neuropal_prompts(directory, timestep=0)
+                    
+                    if not result['success']:
+                        show_info(f"Failed to load NeuroPAL prompts:\n{result['error']}")
+                        return
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    if not hasattr(self, 'neuron_names_map') or self.neuron_names_map is None:
+                        self.neuron_names_map = {}
+                    
+                    # Store prompts and IDs for timestep 0
+                    t = result['timestep']
+                    prompts = result['prompts']
+                    ids = result['ids']
+                    names = result['names']
+                    
+                    self.point_prompts_4d[t] = prompts
+                    self.neuron_names_map = names  # Store neuron names globally
+                    
+                    # Update point_id_map with neuron IDs
+                    for point, point_id in zip(prompts, ids):
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        key = (t, z, y, x)
+                        self.point_id_map[key] = int(point_id)
+                    
+                    # Switch to timestep 0 to show the loaded prompts
+                    try:
+                        self._viewer.dims.current_step = (0,) + self._viewer.dims.current_step[1:]
+                        self.current_timestep = 0
+                    except Exception:
+                        pass
+                    
+                    # Update or create point prompts layer
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        layer.data = prompts
+                        layer.visible = True
+                        # Update colors based on IDs
+                        point_ids_list = [int(pid) for pid in ids]
+                        self._update_point_colors(layer, point_ids_list)
+                    else:
+                        # Create point prompts layer
+                        layer = self._viewer.add_points(
+                            prompts,
+                            name="point_prompts",
+                            size=10,
+                            face_color='red',
+                            edge_color='white',
+                            edge_width=2,
+                            ndim=3
+                        )
+                        # Update colors based on IDs
+                        point_ids_list = [int(pid) for pid in ids]
+                        self._update_point_colors(layer, point_ids_list)
+                    
+                    # Create or update neuron names layer
+                    layer_data = create_neuron_name_layer_data(prompts, ids, names)
+                    
+                    if "Neuron_Names" in self._viewer.layers:
+                        # Update existing layer
+                        name_layer = self._viewer.layers["Neuron_Names"]
+                        name_layer.data = layer_data['coordinates']
+                        name_layer.text = layer_data['text']
+                        name_layer.properties = layer_data['properties']
+                        name_layer.visible = True
+                    else:
+                        # Create new layer with proper visibility
+                        name_layer = self._viewer.add_points(
+                            layer_data['coordinates'],
+                            name="Neuron_Names",
+                            size=8,  # Small but visible points
+                            face_color='yellow',
+                            edge_color='yellow',
+                            edge_width=1,
+                            text=layer_data['text'],
+                            properties=layer_data['properties'],
+                            ndim=3
+                        )
+                        name_layer.visible = True
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    # Force viewer refresh
+                    try:
+                        self._viewer.layers.selection.active = self._viewer.layers["point_prompts"]
+                        self._viewer.reset_view()
+                    except Exception:
+                        pass
+                    
+                    show_info(
+                        f"✓ Loaded {result['num_prompts']} NeuroPAL prompts\n"
+                        f"Neurons: {', '.join([names[int(pid)] for pid in ids])}\n"
+                        f"Switched to timestep 0"
+                    )
+                    
+                except ImportError as e:
+                    show_info(
+                        f"Failed to import NeuroPAL loader:\n{str(e)}\n\n"
+                        "Make sure load_neuropal_prompts.py exists in:\n"
+                        "micro_sam/Neuropal Coordinate Matching/"
+                    )
+                    import traceback
+                    traceback.print_exc()
+                except Exception as e:
+                    print(f"Failed to load NeuroPAL prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to load NeuroPAL prompts:\n{str(e)}")
+
+            btn_load_neuropal.clicked.connect(_load_neuropal_prompts)
+
+            # Insert the point prompt widget after embeddings widget
+            try:
+                self._annotator_widget.layout().insertWidget(1, point_widget)
+            except Exception:
+                # fallback: add at end
+                self._annotator_widget.layout().addWidget(point_widget)
+
+        except Exception as e:
+            print(f"Failed to create point prompt tools: {e}")
+
+        # ================== SAVE SEGMENTATIONS ==================
+        try:
+            save_seg_widget = QtWidgets.QGroupBox("SAVE SEGMENTATIONS")
+            save_seg_widget.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    border: 2px solid #555;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                    color: #00ff88; 
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                }
+            """)
+            save_seg_layout = QtWidgets.QVBoxLayout()
+            save_seg_widget.setLayout(save_seg_layout)
+
+            # Save segmentation button
+            btn_save_seg = QtWidgets.QPushButton("💾 Save Segmentation")
+            btn_save_seg.setToolTip("Save raw ima ge and committed segmentation masks to NPZ file")
+            
+            def _save_segmentation():
+                try:
+                    from qtpy.QtWidgets import QFileDialog
+                    
+                    # Ask user for save location
+                    filepath, _ = QFileDialog.getSaveFileName(
+                        self._viewer.window._qt_window,
+                        "Save Segmentation",
+                        str(Path.home() / "my_segmentation.npz"),
+                        "NumPy Archive (*.npz)"
+                    )
+                    
+                    if not filepath:
+                        return
+                    
+                    filepath = Path(filepath)
+                    if not filepath.suffix:
+                        filepath = filepath.with_suffix('.npz')
+                    
+                    # Check if we have data to save
+                    if self.image_4d is None:
+                        show_info("No image data to save")
+                        return
+                    
+                    if self.segmentation_4d is None:
+                        show_info("No segmentation to save. Commit objects first.")
+                        return
+                    
+                    # Save data
+                    print(f"Saving segmentation to {filepath}...")
+                    np.savez(
+                        filepath,
+                        image_4d=self.image_4d,                    # Raw calcium data (T,Z,Y,X)
+                        segmentation_4d=self.segmentation_4d,      # Committed segmentation (T,Z,Y,X)
+                        n_timesteps=self.n_timesteps,
+                        shape=self.image_4d.shape,
+                    )
+                    
+                    # Save neuron names if available (for fluorescence extraction)
+                    if hasattr(self, 'neuron_names_map') and self.neuron_names_map:
+                        import json
+                        json_path = filepath.with_name(filepath.stem + '_neuron_names.json')
+                        try:
+                            with open(json_path, 'w') as f:
+                                json.dump(self.neuron_names_map, f, indent=2)
+                            print(f"   - Also saved neuron names to {json_path.name}")
+                        except Exception as e:
+                            print(f"   ⚠️ Could not save neuron names: {e}")
+                    
+                    show_info(f"✅ Saved to {filepath.name}")
+                    print(f"✅ Saved segmentation successfully!")
+                    print(f"   - File: {filepath}")
+                    print(f"   - Image shape: {self.image_4d.shape}")
+                    print(f"   - Segmentation shape: {self.segmentation_4d.shape}")
+                    
+                    # Show unique neuron IDs
+                    unique_ids = np.unique(self.segmentation_4d)
+                    unique_ids = unique_ids[unique_ids > 0]  # Exclude background
+                    print(f"   - Neurons saved: {len(unique_ids)} (IDs: {unique_ids.tolist()})")
+                    
+                    # Show neuron names if available
+                    if hasattr(self, 'neuron_names_map') and self.neuron_names_map:
+                        named_neurons = [self.neuron_names_map.get(int(nid), f"ID_{nid}") for nid in unique_ids]
+                        print(f"   - Neuron names: {', '.join(named_neurons)}")
+                    
+                except Exception as e:
+                    print(f"❌ Failed to save segmentation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to save: {e}")
+            
+            btn_save_seg.clicked.connect(_save_segmentation)
+            save_seg_layout.addWidget(btn_save_seg)
+
+            # Insert the save segmentation widget after point prompt widget
+            try:
+                self._annotator_widget.layout().insertWidget(2, save_seg_widget)
+            except Exception:
+                # fallback: add at end
+                self._annotator_widget.layout().addWidget(save_seg_widget)
+
+        except Exception as e:
+            print(f"Failed to create save segmentation tools: {e}")
+
             # --- Remap points UI and Napari points layer ---
             try:
                 # create / reuse a Napari Points layer named 'remap_points' (3D coords)
@@ -3407,22 +4121,157 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             pass
         
+        # Remove all point prompts after successful propagation
+        try:
+            if "point_prompts" in self._viewer.layers:
+                point_layer = self._viewer.layers["point_prompts"]
+                point_layer.data = np.empty((0, 3))
+                print(f"✅ Cleared all point prompts after propagation")
+            
+            # Clear stored point prompts from all timesteps
+            if hasattr(self, 'point_prompts_4d'):
+                for t in range(self.n_timesteps):
+                    if t in self.point_prompts_4d:
+                        self.point_prompts_4d[t] = np.empty((0, 3))
+            
+            # Clear point ID map
+            if hasattr(self, 'point_id_map'):
+                self.point_id_map.clear()
+            
+            # Refresh point manager widget if it exists
+            if hasattr(self, '_point_manager_widget'):
+                try:
+                    self._point_manager_widget.refresh_point_list()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"⚠ Failed to clear point prompts: {e}")
+        
         show_info("Segmentation and propagation complete!")
         print(f"✅ Completed propagation for {len(all_object_ids)} objects")
 
-    # Global verbose flag for propagation debugging
-    _PROPAGATION_VERBOSE = False
+    def _extract_tyx_embeddings_for_z(self, z_slice):
+        """Extract embeddings for a specific Z-slice across all timesteps, organized as TYX.
+        
+        This reorganizes the per-timestep ZYX embedding structure into a TYX structure
+        where time becomes the first dimension, suitable for using segment_mask_in_volume
+        across the temporal dimension.
+        
+        Args:
+            z_slice: The Z-slice index to extract across all timesteps
+            
+        Returns:
+            ImageEmbeddings dict with 'features' as (T, C, H, W) array where T is time,
+            or None if extraction fails
+        """
+        print(f"      Creating TYX embeddings for Z={z_slice}...")
+        
+        # Collect embeddings for this z-slice across all timesteps
+        tyx_features_list = []
+        
+        for t in range(self.n_timesteps):
+            # Get embeddings for this timestep
+            entry = self.embeddings_4d.get(int(t))
+            if entry is None or not isinstance(entry, dict):
+                print(f"        ⚠ No embeddings for t={t}")
+                return None
+            
+            # Materialize if lazy
+            if "path" in entry and "features" not in entry:
+                try:
+                    self._load_embedding_for_timestep(int(t))
+                    entry = self.embeddings_4d.get(int(t))
+                except Exception as e:
+                    print(f"        ⚠ Failed to load embeddings for t={t}: {e}")
+                    return None
+            
+            if "features" not in entry:
+                print(f"        ⚠ No features in embeddings for t={t}")
+                return None
+            
+            features = entry["features"]
+            
+            # Convert to numpy array if it's a zarr array or other lazy type
+            if not isinstance(features, np.ndarray):
+                features = np.array(features)
+            
+            # Extract the z-slice from this timestep's embeddings
+            # Features shape can be:
+            # - (Z, C, H, W) for 3D embeddings
+            # - (Z, 1, C, H, W) for 3D embeddings with batch dimension
+            # - (C, H, W) for single slice
+            try:
+                if len(features.shape) == 5:
+                    # (Z, 1, C, H, W) - has batch dimension, squeeze it
+                    print(f"        t={t}: shape {features.shape}, squeezing batch dimension")
+                    features = features.squeeze(1)  # Now (Z, C, H, W)
+                    if z_slice < features.shape[0]:
+                        z_features = np.array(features[z_slice])  # (C, H, W)
+                    else:
+                        print(f"        ⚠ Z={z_slice} out of bounds for t={t} (max: {features.shape[0]-1})")
+                        return None
+                elif len(features.shape) == 4:
+                    # (Z, C, H, W) - extract specific z-slice
+                    if z_slice < features.shape[0]:
+                        z_features = np.array(features[z_slice])  # (C, H, W)
+                    else:
+                        print(f"        ⚠ Z={z_slice} out of bounds for t={t} (max: {features.shape[0]-1})")
+                        return None
+                elif len(features.shape) == 3:
+                    # (C, H, W) - single slice, use if z_slice == 0
+                    if z_slice == 0:
+                        z_features = np.array(features)
+                    else:
+                        print(f"        ⚠ Single-slice embedding at t={t}, but z_slice={z_slice}")
+                        return None
+                else:
+                    print(f"        ⚠ Unexpected embedding shape at t={t}: {features.shape}")
+                    return None
+                
+                tyx_features_list.append(z_features)
+            except Exception as e:
+                print(f"        ⚠ Error extracting Z={z_slice} from t={t}: {e}")
+                return None
+        
+        # Stack into (T, C, H, W)
+        try:
+            tyx_features = np.stack(tyx_features_list, axis=0)
+        except Exception as e:
+            print(f"        ⚠ Failed to stack features: {e}")
+            return None
+        
+        # Add a batch dimension to make it 5D: (T, 1, C, H, W)
+        # This is required because segment_mask_in_volume expects 5D embeddings
+        # to use indexing (treating T as Z-slices)
+        tyx_features = tyx_features[:, np.newaxis, :, :, :]
+        
+        # Create ImageEmbeddings dict
+        # Use the input_size and original_size from the first timestep as reference
+        first_entry = self.embeddings_4d.get(0)
+        input_size = first_entry.get("input_size") if isinstance(first_entry, dict) else None
+        original_size = first_entry.get("original_size") if isinstance(first_entry, dict) else None
+        
+        tyx_embeddings = {
+            "features": tyx_features,
+            "input_size": input_size,
+            "original_size": original_size,
+        }
+        
+        print(f"      ✓ Created TYX embeddings shape {tyx_features.shape}")
+        return tyx_embeddings
 
     def _propagate_object_forward(self, obj_id, t_start, t_end, mask_start):
-        """Propagate an object mask forward in time slice-by-slice using mask-based tracking.
+        """Propagate an object mask forward in time using volumetric segmentation.
         
-        For each z-slice where the object exists, propagate that 2D mask across time
-        using SAM's segment_from_mask with IoU-based stopping.
+        For each z-slice where the object exists, create a TYX volume (treating time as Z)
+        and use segment_mask_in_volume to propagate across the temporal dimension.
+        This is the approach recommended by your mentor.
         """
-        from micro_sam import prompt_based_segmentation
-        from scipy.ndimage import shift as _shift
+        from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+        from ._state import AnnotatorState
         
-        print(f"  Propagating forward from t={t_start} to t={t_end}")
+        print(f"  Propagating forward from t={t_start} to t={t_end} (exclusive)")
+        print(f"  Total timesteps in dataset: {self.n_timesteps}")
         
         # Find Z slices with mask at anchor
         z_indices = np.where(mask_start.any(axis=(1, 2)))[0]
@@ -3430,140 +4279,147 @@ class MicroSAM4DAnnotator(Annotator3d):
             print(f"    No z-slices with mask at anchor")
             return
         
-        z_min, z_max = z_indices[0], z_indices[-1]
-        print(f"    Propagating forward: Z-slices {z_min}-{z_max}, timesteps {t_start}→{t_end-1}")
+        z_min, z_max = int(z_indices[0]), int(z_indices[-1])
+        print(f"    Initial Z-range: {z_min}-{z_max} (will expand dynamically if object moves in Z)")
         
-        # For each z-slice, propagate across time
-        for z in range(z_min, z_max + 1):
-            mask_2d_prev = mask_start[z]
+        # Get state for predictor
+        state = AnnotatorState()
+        
+        # Track which Z-slices have been processed
+        processed_z_slices = set()
+        
+        # Iteratively process Z-slices, expanding range as object moves in Z
+        iteration = 0
+        max_iterations = 20  # Safety limit to prevent infinite loops
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"    Iteration {iteration}: Processing Z-range {z_min}-{z_max}")
             
-            if not mask_2d_prev.any():
-                continue
+            # Collect Z-slices to process in this iteration
+            z_slices_to_process = []
+            for z in range(z_min, z_max + 1):
+                if z not in processed_z_slices:
+                    z_slices_to_process.append(z)
             
-            # Propagate this z-slice through time
-            for t in range(t_start + 1, t_end):
+            if not z_slices_to_process:
+                print(f"    All Z-slices processed, propagation complete")
+                break
+            
+            # Process each new Z-slice
+            for z in z_slices_to_process:
+                # Check if this z-slice has mask at anchor or was populated in previous iteration
+                mask_2d_anchor = mask_start[z] if z < mask_start.shape[0] else np.zeros(mask_start.shape[1:], dtype=bool)
+                
+                has_mask = mask_2d_anchor.any()
+                if not has_mask:
+                    # Check if previous iteration added this object to this z-slice at any timestep
+                    for t in range(t_start, min(t_end + 1, self.n_timesteps)):
+                        if z < self.current_object_4d[t].shape[0] and (self.current_object_4d[t][z] == obj_id).any():
+                            has_mask = True
+                            mask_2d_anchor = (self.current_object_4d[t][z] == obj_id)
+                            break
+                
+                if not has_mask:
+                    processed_z_slices.add(z)
+                    continue
+                
+                print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+                
                 try:
-                    # Check if this specific z-slice at this timestep already has this object (anchor point)
-                    if (self.current_object_4d[t][z] == obj_id).any():
-                        # This z-slice already has the anchor mask, use it and continue
-                        mask_2d_prev = (self.current_object_4d[t][z] == obj_id)
+                    # Extract TYX embeddings for this z-slice
+                    tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                    if tyx_embeddings is None:
+                        print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                        processed_z_slices.add(z)
                         continue
                     
-                    # Activate embeddings for this timestep - FORCE SYNCHRONOUS LOADING
-                    # During propagation we need embeddings immediately, not async
-                    from ._state import AnnotatorState
-                    state = AnnotatorState()
+                    # Create TYX segmentation volume (T, Y, X)
+                    # Initialize with zeros for all timesteps
+                    image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                    y_size, x_size = image_shape[1], image_shape[2]
+                    tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
                     
-                    # Check if embeddings already loaded
-                    if state.image_embeddings is None or getattr(self, "_active_embedding_t", None) != t:
-                        print(f"        T={t}: loading embeddings synchronously...")
-                        try:
-                            # First, ensure embeddings are loaded from disk if lazy
-                            entry = self.embeddings_4d.get(int(t)) if hasattr(self, "embeddings_4d") else None
-                            if entry is not None and isinstance(entry, dict) and "path" in entry and "features" not in entry:
-                                # Lazy entry - need to load from disk
-                                print(f"        T={t}: loading from disk {entry['path']}")
-                                self._load_embedding_for_timestep(int(t))
-                                
-                                # Wait for load to complete
-                                import time
-                                time.sleep(0.1)
-                            
-                            # Now activate the embeddings in AnnotatorState
-                            if hasattr(self, 'timestep_embedding_manager') and self.timestep_embedding_manager is not None:
-                                self.timestep_embedding_manager.on_timestep_changed(int(t))
-                                time.sleep(0.1)
-                            else:
-                                # Fallback: directly activate embeddings
-                                self._ensure_embeddings_active_for_t(int(t))
-                                time.sleep(0.1)
-                            
-                            # Verify embeddings are now available
-                            if state.image_embeddings is None:
-                                break
-                                
-                        except Exception as load_err:
-                            break
+                    # Set the anchor mask at t_start
+                    tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
                     
-                    # Ensure predictor has the correct image shape
-                    try:
-                        image3d = self.image_4d[int(t)]
-                        state.image_shape = image3d.shape
-                    except Exception:
-                        pass
+                    # Check for other anchor timesteps with this object in this z-slice
+                    anchor_timesteps = [t_start]
+                    for t_check in range(self.n_timesteps):
+                        if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                            tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                            anchor_timesteps.append(t_check)
                     
-                    # Use mask-based segmentation - try without multimask first for debugging
-                    try:
-                        seg_2d = prompt_based_segmentation.segment_from_mask(
-                            state.predictor,
-                            mask_2d_prev,
-                            image_embeddings=state.image_embeddings,
-                            i=z,
-                            use_mask=True,
-                            use_box=True,
-                            use_points=False,
-                            multimask_output=False,  # Single mask for now
-                            return_all=False,
-                        )
-                            
-                    except Exception as seg_err:
-                        break
+                    # Use segment_mask_in_volume to propagate across time dimension
+                    # The "segmented_slices" parameter is the anchor timestep(s)
+                    print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                    tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                        segmentation=tyx_seg,
+                        predictor=state.predictor,
+                        image_embeddings=tyx_embeddings,
+                        segmented_slices=np.array(anchor_timesteps),
+                        stop_lower=False,  # Propagate backward in time
+                        stop_upper=False,  # Propagate forward in time
+                        iou_threshold=0.5,
+                        projection="mask",  # Use mask projection
+                        verbose=False,
+                    )
                     
-                    if seg_2d is None or seg_2d.max() == 0:
-                        break
+                    print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
                     
-                    # Check IoU to decide if we should continue
-                    mask_2d_new = seg_2d > 0
-                    intersection = np.logical_and(mask_2d_prev, mask_2d_new).sum()
-                    union = np.logical_or(mask_2d_prev, mask_2d_new).sum()
-                    iou = intersection / union if union > 0 else 0
+                    # Write back to 4D volume: current_object_4d[:, z, :, :]
+                    # Only write for timesteps between t_start and t_end
+                    print(f"      Z={z}: Writing back results for timesteps {max(t_start, t_min)} to {min(t_end, t_max + 1) - 1}")
+                    for t in range(max(t_start, t_min), min(t_end, t_max + 1)):
+                        if tyx_seg_result[t].any():
+                            # Only write where we have new segmentation
+                            mask_t = tyx_seg_result[t] > 0
+                            pixels_count = np.count_nonzero(mask_t)
+                            # Preserve this object's segmentation
+                            self.current_object_4d[t][z][mask_t] = obj_id
+                            print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
+                        else:
+                            print(f"      Z={z}: No pixels for t={t}")
                     
-                    # Intensity-aware tracking: distinguish deformation from disappearance
-                    try:
-                        image_slice_curr = self.image_4d[t][z]
-                        image_slice_prev = self.image_4d[t-1][z]
-                        
-                        mean_intensity_prev = image_slice_prev[mask_2d_prev].mean() if mask_2d_prev.any() else 0
-                        mean_intensity_curr = image_slice_curr[mask_2d_new].mean() if mask_2d_new.any() else 0
-                        
-                        background_mask = ~(mask_2d_prev | mask_2d_new)
-                        background_intensity = image_slice_curr[background_mask].mean() if background_mask.any() else image_slice_curr.mean()
-                        
-                        intensity_ratio_curr = mean_intensity_curr / (background_intensity + 1e-8)
-                        
-                        print(f"        T={t}: IoU={iou:.3f}, intensity_ratio={intensity_ratio_curr:.2f}")
-                        
-                        if iou < 0.35:
-                            if intensity_ratio_curr < 1.2:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.35 and dim, stopping")
-                                break
-                            elif iou < 0.2:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.2, stopping")
-                                break
-                            else:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.35 but bright, continuing")
-                    except Exception as intensity_err:
-                        if iou < 0.35:
-                            print(f"        T={t}: IoU={iou:.3f} < 0.35, stopping")
-                            break
-                    
-                    # Update the segmentation
-                    self.current_object_4d[t][z][mask_2d_new] = obj_id
-                    mask_2d_prev = mask_2d_new
+                    print(f"      Z={z}: Complete")
+                    processed_z_slices.add(z)
                     
                 except Exception as e:
-                    print(f"        T={t}: error - {e}")
-                    break
+                    print(f"      Z={z}: Error during propagation - {e}")
+                    import traceback
+                    traceback.print_exc()
+                    processed_z_slices.add(z)
+                    continue
             
-            print(f"      Z={z}: done")
+            # After processing all Z-slices in this iteration, check if object expanded to new Z-slices
+            new_z_min, new_z_max = z_min, z_max
+            for t in range(t_start, min(t_end + 1, self.n_timesteps)):
+                z_indices_t = np.where((self.current_object_4d[t] == obj_id).any(axis=(1, 2)))[0]
+                if len(z_indices_t) > 0:
+                    new_z_min = min(new_z_min, int(z_indices_t[0]))
+                    new_z_max = max(new_z_max, int(z_indices_t[-1]))
+            
+            if new_z_min < z_min or new_z_max > z_max:
+                print(f"    Object expanded in Z: {z_min}-{z_max} → {new_z_min}-{new_z_max}")
+                z_min, z_max = new_z_min, new_z_max
+            else:
+                # No expansion, we're done
+                print(f"    No Z expansion detected, propagation complete")
+                break
+        
+        if iteration >= max_iterations:
+            print(f"    Warning: Reached maximum iterations ({max_iterations}), stopping propagation")
+        
+        print(f"    Forward propagation complete")
 
     def _propagate_object_backward(self, obj_id, t_start, t_end, mask_start):
-        """Propagate an object mask backward in time slice-by-slice using mask-based tracking.
+        """Propagate an object mask backward in time using volumetric segmentation.
         
-        For each z-slice where the object exists, propagate that 2D mask across time
-        using SAM's segment_from_mask with IoU-based stopping.
+        Since segment_mask_in_volume propagates in both directions from anchors,
+        backward propagation uses the same volumetric approach as forward.
         """
-        from micro_sam import prompt_based_segmentation
+        from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+        from ._state import AnnotatorState
         
         print(f"  Propagating backward from t={t_start} to t={t_end}")
         
@@ -3573,155 +4429,127 @@ class MicroSAM4DAnnotator(Annotator3d):
             print(f"    No z-slices with mask at anchor")
             return
         
-        z_min, z_max = z_indices[0], z_indices[-1]
-        print(f"    Propagating backward: Z-slices {z_min}-{z_max}, timesteps {t_start}→{t_end}")
+        z_min, z_max = int(z_indices[0]), int(z_indices[-1])
+        print(f"    Initial Z-range: {z_min}-{z_max} (will expand dynamically if object moves in Z)")
         
-        # For each z-slice, propagate across time
-        for z in range(z_min, z_max + 1):
-            mask_2d_prev = mask_start[z]
+        # Get state for predictor
+        state = AnnotatorState()
+        
+        # Track which Z-slices have been processed
+        processed_z_slices = set()
+        
+        # Iteratively process Z-slices, expanding range as object moves in Z
+        iteration = 0
+        max_iterations = 20  # Safety limit
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"    Iteration {iteration}: Processing Z-range {z_min}-{z_max}")
             
-            if not mask_2d_prev.any():
-                continue
-
+            # Collect Z-slices to process in this iteration
+            z_slices_to_process = []
+            for z in range(z_min, z_max + 1):
+                if z not in processed_z_slices:
+                    z_slices_to_process.append(z)
             
-            # Propagate this z-slice through time (backward)
-            for t in range(t_start - 1, t_end - 1, -1):
-                print(f"        T={t}: starting (Z={z})...")
+            if not z_slices_to_process:
+                print(f"    All Z-slices processed, propagation complete")
+                break
+            
+            # For each z-slice, propagate across time using volumetric segmentation
+            for z in z_slices_to_process:
+                mask_2d_anchor = mask_start[z] if z < mask_start.shape[0] else np.zeros(mask_start.shape[1:], dtype=bool)
+                
+                has_mask = mask_2d_anchor.any()
+                if not has_mask:
+                    # Check if previous iteration added this object to this z-slice
+                    for t in range(t_end, min(t_start + 1, self.n_timesteps)):
+                        if z < self.current_object_4d[t].shape[0] and (self.current_object_4d[t][z] == obj_id).any():
+                            has_mask = True
+                            mask_2d_anchor = (self.current_object_4d[t][z] == obj_id)
+                            break
+                
+                if not has_mask:
+                    processed_z_slices.add(z)
+                    continue
+                
+                print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+                
                 try:
-                    # Check if this specific z-slice at this timestep already has this object (anchor point)
-                    if (self.current_object_4d[t][z] == obj_id).any():
-                        # This z-slice already has the anchor mask, use it and continue
-                        mask_2d_prev = (self.current_object_4d[t][z] == obj_id)
-                        print(f"        T={t}: skipping (already has anchor mask at this z-slice)")
+                    # Extract TYX embeddings for this z-slice
+                    tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                    if tyx_embeddings is None:
+                        print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                        processed_z_slices.add(z)
                         continue
                     
-                    # Activate embeddings for this timestep - FORCE SYNCHRONOUS LOADING
-                    from ._state import AnnotatorState
-                    state = AnnotatorState()
+                    # Create TYX segmentation volume (T, Y, X)
+                    image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                    y_size, x_size = image_shape[1], image_shape[2]
+                    tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
                     
-                    # Check if embeddings already loaded
-                    if state.image_embeddings is None or getattr(self, "_active_embedding_t", None) != t:
-                        print(f"        T={t}: loading embeddings synchronously...")
-                        try:
-                            # First, ensure embeddings are loaded from disk if lazy
-                            entry = self.embeddings_4d.get(int(t)) if hasattr(self, "embeddings_4d") else None
-                            if entry is not None and isinstance(entry, dict) and "path" in entry and "features" not in entry:
-                                # Lazy entry - need to load from disk
-                                print(f"        T={t}: loading from disk {entry['path']}")
-                                self._load_embedding_for_timestep(int(t))
-                                
-                                # Wait for load to complete
-                                import time
-                                time.sleep(0.1)
-                            
-                            # Now activate the embeddings in AnnotatorState
-                            if hasattr(self, 'timestep_embedding_manager') and self.timestep_embedding_manager is not None:
-                                self.timestep_embedding_manager.on_timestep_changed(int(t))
-                                time.sleep(0.1)
-                            else:
-                                # Fallback: directly activate embeddings
-                                self._ensure_embeddings_active_for_t(int(t))
-                                time.sleep(0.1)
-                            
-                            # Verify embeddings are now available
-                            if state.image_embeddings is None:
-                                print(f"        T={t}: embeddings still not loaded, check if file exists")
-                                break
-                            else:
-                                print(f"        T={t}: embeddings loaded successfully")
-                                
-                        except Exception as load_err:
-                            print(f"        T={t}: failed to load embeddings: {load_err}")
-                            import traceback
-                            traceback.print_exc()
-                            break
-                    else:
-                        print(f"        T={t}: embeddings already active")
+                    # Set the anchor mask at t_start
+                    tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
                     
-                    print(f"        T={t}: embeddings OK, mask has {mask_2d_prev.sum()} pixels")
+                    # Check for other anchor timesteps
+                    anchor_timesteps = [t_start]
+                    for t_check in range(self.n_timesteps):
+                        if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                            tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                            anchor_timesteps.append(t_check)
                     
-                    # Use mask-based segmentation with multimask_output to get best prediction
-                    try:
-                        # Get multiple mask predictions and pick the best one
-                        masks, scores, _ = prompt_based_segmentation.segment_from_mask(
-                            state.predictor,
-                            mask_2d_prev,
-                            image_embeddings=state.image_embeddings,
-                            i=z,
-                            use_mask=True,
-                            use_box=True,  # Also use bounding box prompt
-                            use_points=False,
-                            multimask_output=True,  # Get multiple predictions
-                            return_all=True,  # Return scores to pick best
-                        )
-                        
-                        # Pick the mask with highest score
-                        if masks is not None and len(masks) > 0 and scores is not None:
-                            best_idx = np.argmax(scores)
-                            seg_2d = masks[best_idx] if masks.ndim == 3 else masks
-                        else:
-                            seg_2d = None
-                            
-                    except Exception as seg_err:
-                        print(f"        T={t}: segment_from_mask error: {seg_err}")
-                        import traceback
-                        traceback.print_exc()
-                        break
+                    # Use segment_mask_in_volume
+                    print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                    tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                        segmentation=tyx_seg,
+                        predictor=state.predictor,
+                        image_embeddings=tyx_embeddings,
+                        segmented_slices=np.array(anchor_timesteps),
+                        stop_lower=False,
+                        stop_upper=True,  # Don't propagate forward (already done)
+                        iou_threshold=0.5,
+                        projection="mask",
+                        verbose=False,
+                    )
                     
-                    if seg_2d is None:
-                        print(f"        T={t}: seg_2d is None")
-                        break
+                    print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
                     
-                    if seg_2d.max() == 0:
-                        print(f"        T={t}: seg_2d is empty (all zeros)")
-                        break
+                    # Write back to 4D volume for timesteps between t_end and t_start
+                    for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
+                        if tyx_seg_result[t].any():
+                            mask_t = tyx_seg_result[t] > 0
+                            self.current_object_4d[t][z][mask_t] = obj_id
                     
-                    print(f"        T={t}: segmentation produced {(seg_2d > 0).sum()} pixels")
-                    
-                    # Check IoU to decide if we should continue
-                    mask_2d_new = seg_2d > 0
-                    intersection = np.logical_and(mask_2d_prev, mask_2d_new).sum()
-                    union = np.logical_or(mask_2d_prev, mask_2d_new).sum()
-                    iou = intersection / union if union > 0 else 0
-                    
-                    # Intensity-aware tracking: distinguish deformation from disappearance
-                    try:
-                        image_slice_curr = self.image_4d[t][z]
-                        image_slice_next = self.image_4d[t+1][z] if t+1 < self.n_timesteps else image_slice_curr
-                        
-                        mean_intensity_prev = image_slice_next[mask_2d_prev].mean() if mask_2d_prev.any() else 0
-                        mean_intensity_curr = image_slice_curr[mask_2d_new].mean() if mask_2d_new.any() else 0
-                        
-                        background_mask = ~(mask_2d_prev | mask_2d_new)
-                        background_intensity = image_slice_curr[background_mask].mean() if background_mask.any() else image_slice_curr.mean()
-                        
-                        intensity_ratio_curr = mean_intensity_curr / (background_intensity + 1e-8)
-                        
-                        print(f"        T={t}: IoU={iou:.3f}, intensity_ratio={intensity_ratio_curr:.2f}")
-                        
-                        if iou < 0.35:
-                            if intensity_ratio_curr < 1.2:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.35 and dim, stopping")
-                                break
-                            elif iou < 0.2:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.2, stopping")
-                                break
-                            else:
-                                print(f"        T={t}: IoU={iou:.3f} < 0.35 but bright, continuing")
-                    except Exception as intensity_err:
-                        if iou < 0.35:
-                            print(f"        T={t}: IoU={iou:.3f} < 0.35, stopping")
-                            break
-                    
-                    # Update the segmentation
-                    self.current_object_4d[t][z][mask_2d_new] = obj_id
-                    mask_2d_prev = mask_2d_new
+                    print(f"      Z={z}: Complete")
+                    processed_z_slices.add(z)
                     
                 except Exception as e:
-                    print(f"        T={t}: error - {e}")
-                    break
+                    print(f"      Z={z}: Error during propagation - {e}")
+                    import traceback
+                    traceback.print_exc()
+                    processed_z_slices.add(z)
+                    continue
             
-            print(f"      Z={z}: done")
+            # After processing all Z-slices, check if object expanded to new Z-slices
+            new_z_min, new_z_max = z_min, z_max
+            for t in range(t_end, min(t_start + 1, self.n_timesteps)):
+                z_indices_t = np.where((self.current_object_4d[t] == obj_id).any(axis=(1, 2)))[0]
+                if len(z_indices_t) > 0:
+                    new_z_min = min(new_z_min, int(z_indices_t[0]))
+                    new_z_max = max(new_z_max, int(z_indices_t[-1]))
+            
+            if new_z_min < z_min or new_z_max > z_max:
+                print(f"    Object expanded in Z: {z_min}-{z_max} → {new_z_min}-{new_z_max}")
+                z_min, z_max = new_z_min, new_z_max
+            else:
+                # No expansion, we're done
+                print(f"    No Z expansion detected, propagation complete")
+                break
+        
+        if iteration >= max_iterations:
+            print(f"    Warning: Reached maximum iterations ({max_iterations}), stopping propagation")
+        
+        print(f"    Backward propagation complete")
 
     def segment_all_timesteps(self):
         """Run manual segmentation for all timesteps that have point prompts.
@@ -4080,6 +4908,15 @@ class MicroSAM4DAnnotator(Annotator3d):
                 traceback.print_exc()
                 continue
 
+        # Save the current timestep's segmentation before restoring (to preserve it)
+        original_t_seg = None
+        if self.current_object_4d is not None:
+            try:
+                original_t_seg = self.current_object_4d[int(original_t)].copy()
+                print(f"💾 Saved segmentation for original timestep {original_t}")
+            except Exception as e:
+                print(f"Warning: Could not save original timestep segmentation: {e}")
+
         # Reconnect dimension slider callback
         if dims_callback_disconnected:
             try:
@@ -4094,6 +4931,23 @@ class MicroSAM4DAnnotator(Annotator3d):
             self._viewer.dims.set_current_step(0, int(original_t))
         except Exception:
             pass
+
+        # Restore the segmentation for the original timestep (in case callback overwrote it)
+        if original_t_seg is not None and self.current_object_4d is not None:
+            try:
+                self.current_object_4d[int(original_t)] = original_t_seg
+                print(f"♻️  Restored segmentation for timestep {original_t}")
+            except Exception as e:
+                print(f"Warning: Could not restore original timestep segmentation: {e}")
+
+        # Force refresh of current_object_4d layer to show the segmentation
+        try:
+            lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
+            if lay is not None:
+                lay.refresh()
+                print(f"✅ Refreshed current_object_4d layer for restored timestep {original_t}")
+        except Exception as e:
+            print(f"Warning: Could not refresh current_object_4d layer: {e}")
 
         # Reconnect point prompts event listener
         if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
@@ -4220,3 +5074,810 @@ class MicroSAM4DAnnotator(Annotator3d):
                     pass
         except Exception:
             pass
+
+    def propagate_point_prompts_to_all_timesteps(self):
+        """Intelligently propagate point prompts across all timesteps.
+        
+        For each timestep:
+        1. Copy point locations from previous timestep
+        2. Move each point to local intensity maximum within search radius
+        3. If point lands in background (black), assign to nearest unprompted neuron blob
+        4. Preserve point IDs across timesteps for consistent tracking
+        """
+        if self.image_4d is None or self.n_timesteps is None:
+            show_info("No 4D image data loaded")
+            return
+        
+        # Get current timestep to use as anchor
+        current_t = int(getattr(self, "current_timestep", 0) or 0)
+        
+        # Check if current timestep has point prompts
+        if not hasattr(self, "point_prompts_4d"):
+            self.point_prompts_4d = {}
+        
+        # Get points from current layer (most up-to-date)
+        if "point_prompts" in self._viewer.layers:
+            current_points = np.array(self._viewer.layers["point_prompts"].data)
+        else:
+            current_points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+        
+        if len(current_points) == 0:
+            show_info(f"No point prompts in current timestep {current_t}. Please add points first.")
+            return
+        
+        # Store current points with their IDs
+        self.point_prompts_4d[current_t] = current_points.copy()
+        
+        # Get point IDs for current timestep
+        current_ids = self._get_point_ids_for_timestep(current_t, current_points)
+        
+        # Search radius for local maxima (in pixels)
+        SEARCH_RADIUS = 7
+        
+        # Intensity threshold percentile (below this is considered background)
+        BACKGROUND_THRESHOLD_PERCENTILE = 50
+        
+        print(f"🔄 Propagating {len(current_points)} points from timestep {current_t} to all {self.n_timesteps} timesteps")
+        
+        # Forward propagation (current_t -> end)
+        for t in range(current_t + 1, int(self.n_timesteps)):
+            self._propagate_points_to_timestep(
+                t, t - 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+            )
+        
+        # Backward propagation (current_t -> start)
+        for t in range(current_t - 1, -1, -1):
+            self._propagate_points_to_timestep(
+                t, t + 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+            )
+        
+        # Update viewer to show propagated points
+        self._update_viewer_after_propagation(current_t)
+        
+        total_points = sum(len(pts) for pts in self.point_prompts_4d.values())
+        show_info(f"✅ Propagated points to all timesteps! Total points: {total_points}")
+    
+    def _propagate_points_to_timestep(self, target_t, source_t, search_radius, threshold_percentile):
+        """Propagate points from source_t to target_t using Hungarian algorithm for optimal matching."""
+        # Get source points
+        source_points = self.point_prompts_4d.get(source_t, np.empty((0, 3)))
+        if len(source_points) == 0:
+            return
+        
+        # Get 3D image for target timestep
+        image_3d = self.image_4d[int(target_t)]
+        
+        # Calculate threshold for background detection
+        nonzero_values = image_3d[image_3d > 0]
+        if len(nonzero_values) > 0:
+            threshold = np.percentile(nonzero_values, threshold_percentile)
+        else:
+            threshold = 0
+        
+        # Create binary mask of foreground regions
+        foreground_mask = image_3d > threshold
+        
+        # Label connected components in foreground
+        labeled_blobs, num_blobs = label(foreground_mask)
+        
+        if num_blobs == 0:
+            # No blobs found - keep points at original positions
+            self.point_prompts_4d[target_t] = source_points.copy()
+            point_ids = self._get_point_ids_for_timestep(source_t, source_points)
+            for idx, point in enumerate(source_points):
+                point_id = point_ids[idx] if idx < len(point_ids) else (idx + 1)
+                z, y, x = int(point[0]), int(point[1]), int(point[2])
+                self._set_point_id_from_coords(target_t, z, y, x, point_id)
+            return
+        
+        # Get blob centroids and properties
+        blob_centroids = {}
+        blob_sizes = {}
+        blob_intensities = {}
+        
+        for blob_id in range(1, num_blobs + 1):
+            blob_mask = labeled_blobs == blob_id
+            if np.any(blob_mask):
+                # Centroid
+                centroid = center_of_mass(blob_mask)
+                blob_centroids[blob_id] = np.array(centroid)
+                
+                # Size (number of pixels)
+                blob_sizes[blob_id] = np.sum(blob_mask)
+                
+                # Average intensity
+                blob_intensities[blob_id] = np.mean(image_3d[blob_mask])
+        
+        # Get point IDs
+        point_ids = self._get_point_ids_for_timestep(source_t, source_points)
+        
+        # Get source image to determine which blob each point was on
+        image_3d_source = self.image_4d[int(source_t)]
+        foreground_mask_source = image_3d_source > threshold
+        labeled_blobs_source, _ = label(foreground_mask_source)
+        
+        # Step 1: Find candidate blobs for each point (local maximum search)
+        # IMPORTANT: Constrain search to same blob to prevent jumping between neurons
+        point_candidates = []  # List of dict with point_idx, blob_id, position, etc.
+        
+        for idx, point in enumerate(source_points):
+            z, y, x = int(point[0]), int(point[1]), int(point[2])
+            
+            # Determine which blob this point was on in source frame
+            source_blob_id = labeled_blobs_source[z, y, x] if z < labeled_blobs_source.shape[0] else 0
+            
+            # Find local maximum, preferring to stay within the same blob
+            new_z, new_y, new_x, stayed_in_blob = self._find_local_maximum_in_blob(
+                image_3d, labeled_blobs, z, y, x, search_radius, source_blob_id
+            )
+            
+            # Get blob at new position
+            blob_id = labeled_blobs[new_z, new_y, new_x]
+            
+            if blob_id > 0:
+                # Point lands on a blob
+                distance = np.sqrt((new_z - z)**2 + (new_y - y)**2 + (new_x - x)**2)
+                intensity = image_3d[new_z, new_y, new_x]
+                point_candidates.append({
+                    'point_idx': idx,
+                    'blob_id': blob_id,
+                    'position': (new_z, new_y, new_x),
+                    'distance': distance,
+                    'intensity': intensity,
+                    'original_pos': (z, y, x)
+                })
+            else:
+                # Point lands in background - find nearest blob
+                nearest_blob, nearest_dist = self._find_nearest_blob(
+                    blob_centroids, z, y, x
+                )
+                if nearest_blob is not None:
+                    centroid = blob_centroids[nearest_blob]
+                    cz, cy, cx = int(centroid[0]), int(centroid[1]), int(centroid[2])
+                    point_candidates.append({
+                        'point_idx': idx,
+                        'blob_id': nearest_blob,
+                        'position': (cz, cy, cx),
+                        'distance': nearest_dist,
+                        'intensity': blob_intensities[nearest_blob],
+                        'original_pos': (z, y, x)
+                    })
+                else:
+                    # No blobs available - will handle later
+                    point_candidates.append({
+                        'point_idx': idx,
+                        'blob_id': None,
+                        'position': (z, y, x),
+                        'distance': 0,
+                        'intensity': 0,
+                        'original_pos': (z, y, x)
+                    })
+        
+        # Step 2: Use Hungarian algorithm for optimal point-to-blob assignment
+        assignments = self._hungarian_match_points_to_blobs(
+            point_candidates, blob_centroids, source_points
+        )
+        
+        # Step 3: Apply assignments and update point prompts
+        propagated_points = []
+        for idx, assignment in enumerate(assignments):
+            point_id = point_ids[idx] if idx < len(point_ids) else (idx + 1)
+            z, y, x = assignment['position']
+            propagated_points.append([z, y, x])
+            self._set_point_id_from_coords(target_t, z, y, x, point_id)
+        
+        # Store propagated points
+        self.point_prompts_4d[target_t] = np.array(propagated_points)
+    
+    def _hungarian_match_points_to_blobs(self, point_candidates, blob_centroids, source_points):
+        """Use Hungarian algorithm to optimally assign points to blobs.
+        
+        This prevents:
+        - Multiple points clustering on the same blob
+        - Points disappearing when greedy matching fails
+        - Incorrect neuron assignments
+        """
+        n_points = len(source_points)
+        unique_blobs = set(c['blob_id'] for c in point_candidates if c['blob_id'] is not None)
+        
+        if len(unique_blobs) == 0:
+            # No blobs available - keep original positions
+            return point_candidates
+        
+        # Build list of all blobs (including duplicates from candidates)
+        all_blobs = list(unique_blobs)
+        n_blobs = len(all_blobs)
+        
+        # If more points than blobs, add dummy blobs (points will keep original positions)
+        if n_points > n_blobs:
+            n_blobs = n_points
+            all_blobs.extend([None] * (n_points - len(all_blobs)))
+        
+        # Create cost matrix: cost[point_idx, blob_idx]
+        # Lower cost = better match
+        cost_matrix = np.zeros((n_points, n_blobs))
+        LARGE_COST = 1e6
+        
+        for i, candidate in enumerate(point_candidates):
+            for j, blob_id in enumerate(all_blobs):
+                if blob_id is None:
+                    # Dummy blob - high cost (only use if no real blob available)
+                    cost_matrix[i, j] = LARGE_COST
+                elif candidate['blob_id'] == blob_id:
+                    # This is the candidate blob for this point - use distance as cost
+                    cost_matrix[i, j] = candidate['distance']
+                elif blob_id in blob_centroids:
+                    # Alternative blob - compute distance from original position
+                    orig_z, orig_y, orig_x = candidate['original_pos']
+                    centroid = blob_centroids[blob_id]
+                    distance = np.sqrt(
+                        (centroid[0] - orig_z)**2 +
+                        (centroid[1] - orig_y)**2 +
+                        (centroid[2] - orig_x)**2
+                    )
+                    # Penalize alternative blobs slightly to prefer original candidates
+                    cost_matrix[i, j] = distance * 1.2
+                else:
+                    cost_matrix[i, j] = LARGE_COST
+        
+        # Run Hungarian algorithm
+        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        
+        # Build final assignments
+        assignments = []
+        for point_idx, blob_idx in zip(row_indices, col_indices):
+            assigned_blob = all_blobs[blob_idx]
+            
+            if assigned_blob is None or cost_matrix[point_idx, blob_idx] >= LARGE_COST:
+                # No good blob match - keep original position
+                orig_pos = point_candidates[point_idx]['original_pos']
+                assignments.append({
+                    'position': orig_pos,
+                    'blob_id': None
+                })
+            elif assigned_blob == point_candidates[point_idx]['blob_id']:
+                # Matched to candidate blob - use candidate position
+                assignments.append(point_candidates[point_idx])
+            else:
+                # Matched to alternative blob - use its centroid
+                centroid = blob_centroids[assigned_blob]
+                cz, cy, cx = int(centroid[0]), int(centroid[1]), int(centroid[2])
+                assignments.append({
+                    'position': (cz, cy, cx),
+                    'blob_id': assigned_blob
+                })
+        
+        return assignments
+    
+    def _find_nearest_blob(self, blob_centroids, z, y, x):
+        """Find the nearest blob centroid to position (z, y, x).
+        
+        Returns:
+            (blob_id, distance) or (None, inf) if no blobs
+        """
+        min_distance = float('inf')
+        nearest_blob = None
+        
+        for blob_id, centroid in blob_centroids.items():
+            distance = np.sqrt(
+                (centroid[0] - z)**2 +
+                (centroid[1] - y)**2 +
+                (centroid[2] - x)**2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_blob = blob_id
+        
+        return nearest_blob, min_distance
+    
+    def _find_local_maximum(self, image_3d, z, y, x, radius):
+        """Find local intensity maximum within radius of (z, y, x).
+        
+        Returns the brightest pixel within the search radius.
+        Note: This does NOT constrain to a specific blob - blob filtering
+        happens in the Hungarian matching step.
+        """
+        shape = image_3d.shape
+        
+        # Define search box
+        z_min = max(0, z - radius)
+        z_max = min(shape[0], z + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(shape[1], y + radius + 1)
+        x_min = max(0, x - radius)
+        x_max = min(shape[2], x + radius + 1)
+        
+        # Extract neighborhood
+        neighborhood = image_3d[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        # Find maximum within neighborhood
+        max_idx = np.unravel_index(np.argmax(neighborhood), neighborhood.shape)
+        
+        # Convert back to global coordinates
+        new_z = z_min + max_idx[0]
+        new_y = y_min + max_idx[1]
+        new_x = x_min + max_idx[2]
+        
+        return new_z, new_y, new_x
+    
+    def _find_local_maximum_in_blob(self, image_3d, labeled_blobs, z, y, x, radius, current_blob_id):
+        """Find local intensity maximum within radius, constrained to the same blob.
+        
+        Args:
+            image_3d: 3D intensity image
+            labeled_blobs: Labeled blob array from scipy.ndimage.label
+            z, y, x: Current position
+            radius: Search radius
+            current_blob_id: Blob ID to constrain search to (0 means unconstrained)
+            
+        Returns:
+            (new_z, new_y, new_x, found_in_same_blob)
+        """
+        shape = image_3d.shape
+        
+        # Define search box
+        z_min = max(0, z - radius)
+        z_max = min(shape[0], z + radius + 1)
+        y_min = max(0, y - radius)
+        y_max = min(shape[1], y + radius + 1)
+        x_min = max(0, x - radius)
+        x_max = min(shape[2], x + radius + 1)
+        
+        # Extract neighborhood
+        neighborhood = image_3d[z_min:z_max, y_min:y_max, x_min:x_max]
+        blob_neighborhood = labeled_blobs[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        if current_blob_id > 0:
+            # First try to find maximum within the same blob
+            same_blob_mask = blob_neighborhood == current_blob_id
+            if np.any(same_blob_mask):
+                # Extract only pixels from the same blob
+                blob_intensities = neighborhood[same_blob_mask]
+                
+                # Find maximum intensity within same blob
+                max_intensity = np.max(blob_intensities)
+                
+                # Find position of this maximum in the neighborhood
+                max_positions = np.where((neighborhood == max_intensity) & same_blob_mask)
+                
+                # Use first occurrence if multiple maxima
+                max_idx = (max_positions[0][0], max_positions[1][0], max_positions[2][0])
+                
+                new_z = int(z_min + max_idx[0])
+                new_y = int(y_min + max_idx[1])
+                new_x = int(x_min + max_idx[2])
+                
+                return new_z, new_y, new_x, True
+        
+        # If no constraint or blob not found, search globally
+        max_idx = np.unravel_index(np.argmax(neighborhood), neighborhood.shape)
+        
+        new_z = int(z_min + max_idx[0])
+        new_y = int(y_min + max_idx[1])
+        new_x = int(x_min + max_idx[2])
+        
+        return new_z, new_y, new_x, False
+    
+    def _find_nearest_unprompted_blob(self, labeled_blobs, blob_has_point, z, y, x, num_blobs):
+        """Find centroid of nearest blob that doesn't have a point yet."""
+        if num_blobs == 0:
+            return None
+        
+        # Get centroids of all blobs
+        from scipy.ndimage import center_of_mass
+        
+        # Find unprompted blobs
+        unprompted_blobs = []
+        for blob_id in range(1, num_blobs + 1):
+            if blob_id not in blob_has_point:
+                blob_mask = labeled_blobs == blob_id
+                if np.any(blob_mask):
+                    centroid = center_of_mass(blob_mask)
+                    unprompted_blobs.append((blob_id, centroid))
+        
+        if len(unprompted_blobs) == 0:
+            return None
+        
+        # Find nearest unprompted blob
+        min_distance = float('inf')
+        nearest_centroid = None
+        
+        for blob_id, (cz, cy, cx) in unprompted_blobs:
+            distance = np.sqrt((cz - z)**2 + (cy - y)**2 + (cx - x)**2)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_centroid = (int(cz), int(cy), int(cx))
+        
+        return nearest_centroid
+    
+    def _update_viewer_after_propagation(self, current_t):
+        """Update viewer to show propagated points for current timestep."""
+        if "point_prompts" in self._viewer.layers:
+            # Get points for current timestep
+            current_points = self.point_prompts_4d.get(current_t, np.empty((0, 3)))
+            
+            # Update layer
+            layer = self._viewer.layers["point_prompts"]
+            layer.data = current_points
+            
+            # Update colors based on IDs
+            if len(current_points) > 0:
+                point_ids = self._get_point_ids_for_timestep(current_t, current_points)
+                self._update_point_colors(layer, point_ids)
+        
+        # Refresh point manager if available
+        if hasattr(self, "_point_manager_widget"):
+            self._point_manager_widget.refresh_point_list()
+    def propagate_current_segmentation(self):
+        """Propagate segmentations from current timestep to all others using centroid tracking.
+        
+        This function:
+        1. Gets segmented neurons from current timestep
+        2. Calculates brightness-weighted centroids for each neuron
+        3. For each other timestep:
+           - Finds new centroid positions (local intensity maxima)
+           - Uses Hungarian algorithm for optimal neuron matching
+           - Translates masks based on optimal assignments
+        4. Only uses embeddings for current timestep (not propagated frames)
+        
+        Advantages:
+        - Fast: No re-segmentation or new embeddings needed
+        - Robust: Hungarian algorithm prevents neuron ID swapping
+        - Memory efficient: Reuses existing masks
+        
+        Assumptions:
+        - Neurons don't deform significantly (rigid translation)
+        - Movement is relatively smooth frame-to-frame
+        - Neurons remain well-separated (minimal overlap)
+        """
+        if self.image_4d is None or self.n_timesteps is None:
+            show_info("No 4D image data loaded")
+            return
+        
+        # Get current timestep
+        current_t = int(getattr(self, "current_timestep", 0) or 0)
+        
+        # Check if there are committed segmentations at current timestep
+        if self.segmentation_4d is None:
+            show_info("No segmentation data available. Please segment and commit objects first.")
+            return
+        
+        current_seg = self.segmentation_4d[current_t]
+        neuron_ids = np.unique(current_seg)
+        neuron_ids = neuron_ids[neuron_ids > 0]  # Exclude background
+        
+        if len(neuron_ids) == 0:
+            show_info(f"No segmented neurons at timestep {current_t}. Please segment objects first.")
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"🔄 PROPAGATING {len(neuron_ids)} NEURONS FROM TIMESTEP {current_t}")
+        print(f"{'='*70}\n")
+        
+        # Calculate reference centroids at current timestep
+        ref_centroids = {}
+        for neuron_id in neuron_ids:
+            centroid = self._calculate_brightness_weighted_centroid(
+                self.image_4d[current_t],
+                current_seg,
+                neuron_id
+            )
+            ref_centroids[neuron_id] = centroid
+            print(f"  Neuron {neuron_id:3d}: Reference centroid at {centroid}")
+        
+        # Configuration
+        SEARCH_RADIUS = 8   # pixels - reduced to avoid jumping to neighbors
+        MAX_MOVEMENT = 50   # pixels - warn if neuron moves more than this
+        
+        # Propagate to all other timesteps
+        n_success = 0
+        n_warnings = 0
+        
+        for t in range(int(self.n_timesteps)):
+            if t == current_t:
+                continue
+            
+            print(f"\n  Timestep {t}/{self.n_timesteps-1}:")
+            
+            # Find candidate centroids in this timestep
+            candidate_centroids = {}
+            for neuron_id, ref_centroid in ref_centroids.items():
+                new_centroid = self._find_candidate_centroid(
+                    self.image_4d[t],
+                    ref_centroid,
+                    SEARCH_RADIUS
+                )
+                candidate_centroids[neuron_id] = new_centroid
+            
+            # Hungarian matching for optimal assignment
+            assignments = self._hungarian_match_centroids(
+                ref_centroids,
+                candidate_centroids,
+                neuron_ids
+            )
+            
+            # Apply translations and create new segmentation
+            for neuron_id, (old_centroid, new_centroid) in assignments.items():
+                offset = new_centroid - old_centroid
+                distance = np.linalg.norm(offset)
+                
+                if distance > MAX_MOVEMENT:
+                    print(f"    ⚠️  Neuron {neuron_id}: moved {distance:.1f} pixels (>{MAX_MOVEMENT})")
+                    n_warnings += 1
+                else:
+                    print(f"    ✓ Neuron {neuron_id}: moved {distance:.1f} pixels")
+                
+                # Translate mask
+                self._translate_mask(
+                    current_seg,
+                    self.segmentation_4d[t],
+                    neuron_id,
+                    offset
+                )
+            
+            n_success += 1
+        
+        # Update viewer
+        self._update_segmentation_layer()
+        
+        print(f"\n{'='*70}")
+        print(f"✅ PROPAGATION COMPLETE!")
+        print(f"   Propagated to {n_success} timesteps")
+        print(f"   {n_warnings} movement warnings (distance > {MAX_MOVEMENT} pixels)")
+        print(f"{'='*70}\n")
+        
+        show_info(
+            f"✅ Propagated {len(neuron_ids)} neurons to {n_success} timesteps!\n"
+            f"Warnings: {n_warnings} large movements detected.\n"
+            f"Review results and manually fix any issues."
+        )
+    
+    def _calculate_brightness_weighted_centroid(self, image_3d, segmentation_3d, neuron_id):
+        """Calculate brightness-weighted centroid of a neuron using only bright pixels.
+        
+        This uses only the brightest 50% of pixels to avoid bias from dim background pixels.
+        
+        Args:
+            image_3d: 3D intensity image (Z, Y, X)
+            segmentation_3d: 3D segmentation mask (Z, Y, X)
+            neuron_id: ID of neuron to calculate centroid for
+        
+        Returns:
+            centroid: np.array([z, y, x]) - brightness-weighted center
+        """
+        mask = segmentation_3d == neuron_id
+        
+        if not np.any(mask):
+            # No pixels found - return zero
+            return np.array([0.0, 0.0, 0.0])
+        
+        # Get coordinates and intensities
+        coords = np.argwhere(mask)  # Shape: (N, 3) as [z, y, x]
+        intensities = image_3d[mask]
+        
+        # Handle case where all intensities are zero or negative
+        if np.sum(intensities) <= 0 or np.max(intensities) <= 0:
+            # Fall back to geometric centroid
+            return np.mean(coords, axis=0)
+        
+        # IMPROVEMENT: Use only the brightest pixels (top 50% intensity)
+        # This prevents dim background pixels from pulling the centroid away
+        intensity_threshold = np.percentile(intensities, 50)
+        bright_mask = intensities >= intensity_threshold
+        
+        if not np.any(bright_mask):
+            # Fallback if filtering fails
+            return np.mean(coords, axis=0)
+        
+        bright_coords = coords[bright_mask]
+        bright_intensities = intensities[bright_mask]
+        
+        # Brightness-weighted centroid using only bright pixels
+        centroid = np.average(bright_coords, axis=0, weights=bright_intensities)
+        
+        return centroid
+    
+    def _find_candidate_centroid(self, image_3d, ref_centroid, search_radius):
+        """Find new centroid position in target timestep.
+        
+        Searches for local intensity maximum near the reference centroid.
+        PRIORITIZES PROXIMITY over brightness to avoid jumping to brighter neighbors.
+        
+        Args:
+            image_3d: 3D intensity image at target timestep
+            ref_centroid: Reference centroid position [z, y, x]
+            search_radius: How far to search (in pixels)
+        
+        Returns:
+            new_centroid: np.array([z, y, x]) - new centroid position
+        """
+        z_ref, y_ref, x_ref = ref_centroid.astype(int)
+        shape = image_3d.shape
+        
+        # Define search region (clipped to image bounds)
+        z_min = max(0, z_ref - search_radius)
+        z_max = min(shape[0], z_ref + search_radius + 1)
+        y_min = max(0, y_ref - search_radius)
+        y_max = min(shape[1], y_ref + search_radius + 1)
+        x_min = max(0, x_ref - search_radius)
+        x_max = min(shape[2], x_ref + search_radius + 1)
+        
+        # Extract search region
+        region = image_3d[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        if region.size == 0 or np.max(region) == 0:
+            # Empty or dark region - return reference position
+            return ref_centroid
+        
+        # IMPROVEMENT: Find local maxima using maximum_filter
+        # This finds peaks without necessarily choosing the global maximum
+        from scipy.ndimage import maximum_filter
+        
+        # Find local maxima (peaks that are higher than their neighbors)
+        local_max_mask = maximum_filter(region, size=3) == region
+        local_max_mask &= (region > 0)  # Must be positive intensity
+        
+        if not np.any(local_max_mask):
+            # No local maxima found - return reference position
+            return ref_centroid
+        
+        # Get all local maximum positions
+        local_max_coords = np.argwhere(local_max_mask)  # In local coordinates
+        local_max_intensities = region[local_max_coords[:, 0], 
+                                       local_max_coords[:, 1], 
+                                       local_max_coords[:, 2]]
+        
+        # Convert to global coordinates
+        global_max_coords = local_max_coords + np.array([z_min, y_min, x_min])
+        
+        # CRITICAL FIX: Choose the local maximum CLOSEST to reference position
+        # not the brightest one (which could be a neighbor)
+        distances = np.linalg.norm(global_max_coords - ref_centroid, axis=1)
+        
+        # Weight by both distance (lower is better) and intensity (higher is better)
+        # Normalize both to 0-1 range
+        norm_distances = distances / (np.max(distances) + 1e-6)
+        norm_intensities = local_max_intensities / (np.max(local_max_intensities) + 1e-6)
+        
+        # Combined score: prioritize proximity (80%) over brightness (20%)
+        # Lower score is better
+        scores = 0.8 * norm_distances - 0.2 * norm_intensities
+        
+        # Choose the peak with the best score (closest with reasonable brightness)
+        best_idx = np.argmin(scores)
+        peak_global = global_max_coords[best_idx]
+        
+        # Refine by calculating weighted centroid around this peak
+        refine_radius = 3
+        
+        z_peak, y_peak, x_peak = peak_global
+        z_min2 = max(0, z_peak - refine_radius)
+        z_max2 = min(shape[0], z_peak + refine_radius + 1)
+        y_min2 = max(0, y_peak - refine_radius)
+        y_max2 = min(shape[1], y_peak + refine_radius + 1)
+        x_min2 = max(0, x_peak - refine_radius)
+        x_max2 = min(shape[2], x_peak + refine_radius + 1)
+        
+        region2 = image_3d[z_min2:z_max2, y_min2:y_max2, x_min2:x_max2]
+        
+        if region2.size == 0 or np.sum(region2) == 0:
+            # Return peak position if refinement fails
+            return peak_global.astype(float)
+        
+        # Calculate brightness-weighted centroid in refined region
+        coords = np.argwhere(region2)
+        intensities = region2[coords[:, 0], coords[:, 1], coords[:, 2]]
+        
+        # Use only brightest 70% of pixels for weighting
+        intensity_threshold = np.percentile(intensities, 30)
+        bright_mask = intensities >= intensity_threshold
+        
+        if np.any(bright_mask):
+            bright_coords = coords[bright_mask]
+            bright_intensities = intensities[bright_mask]
+            local_centroid = np.average(bright_coords, axis=0, weights=bright_intensities)
+        else:
+            local_centroid = np.mean(coords, axis=0)
+        
+        # Convert back to global coordinates
+        global_centroid = local_centroid + np.array([z_min2, y_min2, x_min2])
+        
+        return global_centroid
+    
+    def _hungarian_match_centroids(self, ref_centroids, candidate_centroids, neuron_ids):
+        """Use Hungarian algorithm to optimally match neurons between timesteps.
+        
+        This prevents neurons from swapping IDs when they cross paths or
+        when one neuron moves much faster than another.
+        
+        Args:
+            ref_centroids: dict {neuron_id: ref_centroid}
+            candidate_centroids: dict {neuron_id: candidate_centroid}
+            neuron_ids: list of neuron IDs
+        
+        Returns:
+            assignments: dict {neuron_id: (ref_centroid, matched_centroid)}
+        """
+        n = len(neuron_ids)
+        
+        if n == 0:
+            return {}
+        
+        if n == 1:
+            # Only one neuron - trivial assignment
+            nid = neuron_ids[0]
+            return {nid: (ref_centroids[nid], candidate_centroids[nid])}
+        
+        # Build cost matrix: cost[i, j] = distance from ref_i to candidate_j
+        cost_matrix = np.zeros((n, n))
+        
+        for i, nid_i in enumerate(neuron_ids):
+            ref_c = ref_centroids[nid_i]
+            for j, nid_j in enumerate(neuron_ids):
+                cand_c = candidate_centroids[nid_j]
+                distance = np.linalg.norm(ref_c - cand_c)
+                cost_matrix[i, j] = distance
+        
+        # Solve assignment problem with Hungarian algorithm
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        # Build assignments dictionary
+        assignments = {}
+        for i, j in zip(row_ind, col_ind):
+            neuron_id = neuron_ids[i]
+            ref_c = ref_centroids[neuron_id]
+            # Match to the candidate of neuron_ids[j]
+            matched_nid = neuron_ids[j]
+            cand_c = candidate_centroids[matched_nid]
+            assignments[neuron_id] = (ref_c, cand_c)
+        
+        return assignments
+    
+    def _translate_mask(self, source_seg, target_seg, neuron_id, offset):
+        """Translate a neuron mask by a given offset.
+        
+        Args:
+            source_seg: Source segmentation (reference timestep)
+            target_seg: Target segmentation (will be modified in-place)
+            neuron_id: ID of neuron to translate
+            offset: Translation vector [dz, dy, dx]
+        """
+        # Get source mask
+        mask = source_seg == neuron_id
+        
+        if not np.any(mask):
+            return
+        
+        # Get coordinates of mask
+        coords = np.argwhere(mask)  # Shape: (N, 3) as [z, y, x]
+        
+        # Translate coordinates
+        new_coords = coords + offset.astype(int)
+        
+        # Clip to image bounds
+        shape = target_seg.shape
+        new_coords[:, 0] = np.clip(new_coords[:, 0], 0, shape[0] - 1)
+        new_coords[:, 1] = np.clip(new_coords[:, 1], 0, shape[1] - 1)
+        new_coords[:, 2] = np.clip(new_coords[:, 2], 0, shape[2] - 1)
+        
+        # Check for collisions (existing non-zero pixels at new positions)
+        collision_mask = target_seg[new_coords[:, 0], new_coords[:, 1], new_coords[:, 2]] > 0
+        
+        if np.any(collision_mask):
+            # Only write to positions that are currently background
+            non_collision_coords = new_coords[~collision_mask]
+            if len(non_collision_coords) > 0:
+                target_seg[non_collision_coords[:, 0], non_collision_coords[:, 1], non_collision_coords[:, 2]] = neuron_id
+        else:
+            # No collisions - write all pixels
+            target_seg[new_coords[:, 0], new_coords[:, 1], new_coords[:, 2]] = neuron_id
+    
+    def _update_segmentation_layer(self):
+        """Update the segmentation layer in the viewer."""
+        if "committed_objects_4d" in self._viewer.layers:
+            layer = self._viewer.layers["committed_objects_4d"]
+            layer.data = self.segmentation_4d
+            try:
+                layer.refresh()
+            except Exception:
+                pass

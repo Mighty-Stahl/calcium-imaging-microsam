@@ -70,7 +70,7 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "/Users/arnlois/data/code/cropped2_sub-20190928-13_ses-20190928_ophys_calcium.npz"
+    default_npz_path = "/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz"
 
     if image4d is None:
         print(f"Loading default NPZ from: {default_npz_path}")
@@ -100,7 +100,7 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:10]
+    image4d = image4d[1:100]
     print(f"Trimmed: new shape = {image4d.shape}")
 
     # create Napari viewer and annotator

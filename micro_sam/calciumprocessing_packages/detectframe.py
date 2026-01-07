@@ -12,6 +12,9 @@ end = int((stim_time + response) * fps)
 result = int((end - start) * fps)
 x = int((stim_time - (stim_time - baseline)) * fps)
 
-
+print()
+print("Start:" + str(start))
 print("Stimulus Frame: " + str(x))
+print("End:" + str(end))
+print()
 

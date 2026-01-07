@@ -9,7 +9,7 @@ from pynwb import NWBHDF5IO
 
 # ===== HARDCODED PARAMETERS - EDIT THESE =====
 NWB_PATH = "/Users/arnlois/000981/Hermaphrodites/sub-20220327-h2/sub-20220327-h2_ses-20220327_ophys.nwb"
-OUTPUT_PATH = "calcium_extracted_gaussian.npz"
+OUTPUT_PATH = "calcium_extracted_gaussian_full.npz"
 
 fps = 2.67
 
@@ -19,9 +19,17 @@ stim_frame = int(stim_time * fps)
 baseline = 10.0
 response = 15  # seconds
 
+# Include frame 0, exclude middle frames, include baseline before stimulus through response
+START_FRAME = 0
+END_FRAME = int((stim_time + response) * fps)  # End after response period
 
-START_FRAME = int((stim_time - baseline) * fps)
-END_FRAME = int((stim_time + response) * fps)  # Set to None for all frames
+# Exclude frames 1 through (stim_frame - baseline - 1), keep frame 0 and (stim_frame - baseline) onwards
+baseline_frames = int(baseline * fps)
+EXCLUDE_TIMESTEPS = range(1, stim_frame - baseline_frames)  # Excludes frames 1 to 886
+# EXCLUDE_TIMESTEPS = [1, 5, 10]      # Skip specific frames
+# EXCLUDE_TIMESTEPS = range(1, 100)   # Skip frames 1-99 (range end is exclusive)
+# EXCLUDE_TIMESTEPS = list(range(0, 50)) + list(range(900, 953))  # Skip multiple ranges
+
 CHANNEL = 1  # 0 - RED, 1 - GREEN, 3 - BLUE
 SERIES_NAME = "CalciumImageSeries"
 COMPRESS = True
@@ -48,6 +56,7 @@ def convert_nwb_to_npz(
     sigma_z: float = 0.5,
     sigma_y: float = 1.0,
     sigma_x: float = 1.0,
+    exclude_timesteps: list = None,
 ):
     """Convert NWB calcium imaging to NPZ.
     
@@ -92,9 +101,40 @@ def convert_nwb_to_npz(
         n_frames = end_frame - start_frame
         print(f"\nExtracting frames {start_frame} to {end_frame-1} ({n_frames} frames)")
         
-        # Load data slice (memory-mapped if possible)
-        print("Loading data...")
-        arr = np.asarray(series.data[start_frame:end_frame])
+        # Exclude specific timesteps if requested (memory-efficient chunk loading)
+        if exclude_timesteps:
+            # Convert range objects to list
+            if isinstance(exclude_timesteps, range):
+                exclude_timesteps = list(exclude_timesteps)
+            
+            # Convert to indices relative to the extracted range and build frame list
+            frames_to_load = []
+            for i in range(start_frame, end_frame):
+                if i not in exclude_timesteps:
+                    frames_to_load.append(i)
+            
+            n_excluded = n_frames - len(frames_to_load)
+            if n_excluded > 0:
+                print(f"\nExcluding {n_excluded} timesteps")
+                print(f"  Loading {len(frames_to_load)} frames instead of {n_frames}")
+                
+                # Load frames one by one (memory efficient for large exclusions)
+                frame_list = []
+                print(f"  Loading frames:", end=" ", flush=True)
+                for idx, frame_num in enumerate(frames_to_load):
+                    if idx % 50 == 0:
+                        print(f"{idx}/{len(frames_to_load)}", end="...", flush=True)
+                    frame_list.append(series.data[frame_num])
+                print("done")
+                
+                arr = np.stack(frame_list, axis=0)
+                print(f"  Shape after exclusion: {arr.shape}")
+            else:
+                # No frames to exclude in this range
+                arr = np.asarray(series.data[start_frame:end_frame])
+        else:
+            arr = np.asarray(series.data[start_frame:end_frame])
+        
         print(f"  Loaded shape: {arr.shape}")
         
     # Handle channel selection
@@ -202,6 +242,7 @@ def main():
         sigma_z=GAUSSIAN_SIGMA_Z,
         sigma_y=GAUSSIAN_SIGMA_Y,
         sigma_x=GAUSSIAN_SIGMA_X,
+        exclude_timesteps=EXCLUDE_TIMESTEPS,
     )
 
 
