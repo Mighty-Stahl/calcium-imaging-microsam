@@ -15,7 +15,7 @@ from micro_sam.sam_annotator.annotator_4d import MicroSAM4DAnnotator
 
 
 
-# fake data
+# fake data 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run MicroSAM 4D annotator demo")
     parser.add_argument("--fake-data", action="store_true", help="Use synthetic 4D data")
@@ -70,7 +70,7 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz"
+    default_npz_path = "/Users/arnlois/data/code/cropped2_sub-20190928-13_ses-20190928_ophys_calcium.npz"
 
     if image4d is None:
         print(f"Loading default NPZ from: {default_npz_path}")

@@ -479,9 +479,6 @@ def segment_slices_with_prompts(
                 # Remove this slice from the annotated slices, so that it is segmented via
                 # projection in the next step.
                 slices = np.setdiff1d(slices, i)
-                print(f"You have provided a stop annotation (single red point) in slice {i},")
-                print("but you have annotated slices above or below it. This stop annotation will")
-                print(f"be ignored and the slice {i} will be segmented normally.")
 
             update_progress(1)
             continue

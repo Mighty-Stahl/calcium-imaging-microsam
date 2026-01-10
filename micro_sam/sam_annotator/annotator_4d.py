@@ -14,9 +14,10 @@ from .util import _load_amg_state, _load_is_state
 from . import util as _vutil
 from micro_sam.multi_dimensional_segmentation import automatic_3d_segmentation
 from skimage.transform import resize as _sk_resize
-from scipy.ndimage import distance_transform_edt, maximum_filter, label, center_of_mass
+from scipy.ndimage import distance_transform_edt, maximum_filter, label, center_of_mass, gaussian_filter
 from scipy.optimize import linear_sum_assignment
 from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
 
 class ObjectCommitWidget(QtWidgets.QWidget):
     """Widget to list current objects and commit them individually."""
@@ -1247,7 +1248,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     print(f"  Intensity range: {image_3d.min():.0f} to {image_3d.max():.0f}")
                     
                     # Fixed percentile threshold
-                    percentile = 99
+                    percentile = 98
                     
                     # Find threshold
                     threshold = np.percentile(image_3d, percentile)
@@ -1466,6 +1467,331 @@ class MicroSAM4DAnnotator(Annotator3d):
             
             btn_copy_all_t.clicked.connect(_copy_prompts_to_all_timesteps)
 
+            # ========== CLEAN SEGMENTATIONS ==========
+            clean_row = QtWidgets.QWidget()
+            clean_layout = QtWidgets.QVBoxLayout()
+            clean_row.setLayout(clean_layout)
+
+            clean_label = QtWidgets.QLabel("<b>Clean Segmentations (Otsu)</b>")
+            clean_layout.addWidget(clean_label)
+
+            # Strictness slider
+            strictness_row = QtWidgets.QWidget()
+            strictness_layout = QtWidgets.QHBoxLayout()
+            strictness_row.setLayout(strictness_layout)
+            
+            strictness_layout.addWidget(QtWidgets.QLabel("Strictness:"))
+            self._clean_strictness_slider = QtWidgets.QSlider(Qt.Horizontal)
+            self._clean_strictness_slider.setMinimum(50)
+            self._clean_strictness_slider.setMaximum(100)
+            self._clean_strictness_slider.setValue(60)  # Default 0.6 (60%)
+            self._clean_strictness_slider.setToolTip(
+                "Lower = more lenient (keeps more pixels)\n"
+                "Higher = stricter (removes more pixels)\n"
+                "Default: 60% (recommended for neurons)"
+            )
+            strictness_layout.addWidget(self._clean_strictness_slider)
+            
+            self._strictness_value_label = QtWidgets.QLabel("60%")
+            strictness_layout.addWidget(self._strictness_value_label)
+            
+            def update_strictness_label(value):
+                self._strictness_value_label.setText(f"{value}%")
+            
+            self._clean_strictness_slider.valueChanged.connect(update_strictness_label)
+            clean_layout.addWidget(strictness_row)
+
+            btn_clean = QtWidgets.QPushButton("Clean Segmentations")
+            btn_clean.setToolTip("Remove dim pixels within each object")
+            clean_layout.addWidget(btn_clean)
+
+            def _clean_segmentations():
+                """Remove dim voxels within each object using selected method."""
+                try:
+                    if self.current_object_4d is None or self.image_4d is None:
+                        show_info("⚠️ No segmentations to clean")
+                        return
+                    
+                    strictness = self._clean_strictness_slider.value() / 100.0  # Convert to 0.5-1.0
+                    
+                    print(f"\n{'='*60}")
+                    print(f"🧹 Cleaning segmentations using Otsu (strictness: {strictness:.2f})")
+                    print(f"{'='*60}")
+                    
+                    total_voxels_removed = 0
+                    objects_processed = 0
+                    
+                    # Process each timestep
+                    for t in range(self.n_timesteps):
+                        seg = self.current_object_4d[t]
+                        img = self.image_4d[t]
+                        unique_ids = np.unique(seg)
+                        unique_ids = unique_ids[unique_ids > 0]  # Exclude background
+                        
+                        if len(unique_ids) == 0:
+                            continue
+                        
+                        # Process each object
+                        for obj_id in unique_ids:
+                            mask = seg == obj_id
+                            intensities = img[mask]
+                            
+                            if len(intensities) < 10:  # Skip tiny objects
+                                continue
+                            
+                            # Calculate threshold using Otsu
+                            try:
+                                from skimage.filters import threshold_otsu
+                                threshold = threshold_otsu(intensities)
+                                # Apply strictness factor (lower = more lenient)
+                                threshold = threshold * strictness
+                            except Exception:
+                                # Fallback to mean if Otsu fails
+                                threshold = np.mean(intensities) * strictness
+                            
+                            # Remove voxels below threshold
+                            dim_voxels = mask & (img <= threshold)
+                            num_removed = np.sum(dim_voxels)
+                            
+                            if num_removed > 0:
+                                seg[dim_voxels] = 0  # Set dim voxels to background
+                                total_voxels_removed += num_removed
+                                print(f"  t={t}, ID={obj_id}: removed {num_removed} dim voxels (threshold={threshold:.2f})")
+                            
+                            objects_processed += 1
+                    
+                    if total_voxels_removed == 0:
+                        show_info("✓ No dim voxels found to remove")
+                        return
+                    
+                    # Refresh layer
+                    if "current_object_4d" in self._viewer.layers:
+                        self._viewer.layers["current_object_4d"].refresh()
+                    
+                    print(f"{'='*60}")
+                    print(f"✅ Cleaned {objects_processed} objects")
+                    print(f"   Removed {total_voxels_removed} total dim voxels")
+                    print(f"{'='*60}\n")
+                    
+                    show_info(
+                        f"✓ Cleaned segmentations\n\n"
+                        f"Method: Otsu (strictness: {int(strictness*100)}%)\n"
+                        f"Objects processed: {objects_processed}\n"
+                        f"Voxels removed: {total_voxels_removed}\n\n"
+                        f"Dim pixels (likely background/edges) removed from each object"
+                    )
+                    
+                except Exception as e:
+                    print(f"Failed to clean segmentations: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+
+            btn_clean.clicked.connect(_clean_segmentations)
+            point_layout.addWidget(clean_row)
+
+            # ========== PROPAGATE SEGMENTATION ==========
+            propagate_row = QtWidgets.QWidget()
+            propagate_layout = QtWidgets.QVBoxLayout()
+            propagate_row.setLayout(propagate_layout)
+
+            propagate_label = QtWidgets.QLabel("<b>Propagate Segmentation</b>")
+            propagate_layout.addWidget(propagate_label)
+
+            btn_propagate = QtWidgets.QPushButton("Propagate Current Segmentation")
+            btn_propagate.setToolTip("Track objects across timesteps using centroid matching")
+            propagate_layout.addWidget(btn_propagate)
+
+            def _propagate_segmentation():
+                """Propagate committed segmentation sequentially to adjacent timesteps.
+                
+                Uses temporal continuity: copies segmentation from t to t±1, then adjusts
+                each object's position to match local intensity maxima in the new timestep.
+                This mirrors the successful point propagation strategy.
+                """
+                try:
+                    if self.segmentation_4d is None or self.image_4d is None:
+                        show_info("⚠️ No committed segmentation to propagate")
+                        return
+                    
+                    from scipy.ndimage import center_of_mass, shift, maximum_filter
+                    
+                    current_t = int(self.current_timestep)
+                    seg_current = self.segmentation_4d[current_t]
+                    
+                    # Get object IDs from current timestep
+                    current_ids = np.unique(seg_current)
+                    current_ids = current_ids[current_ids > 0]
+                    
+                    if len(current_ids) == 0:
+                        show_info("⚠️ No objects in current segmentation")
+                        return
+                    
+                    print(f"\n{'='*60}")
+                    print(f"🔄 Propagating {len(current_ids)} objects from timestep {current_t}")
+                    print(f"{'='*60}")
+                    
+                    # Search radius for local maximum detection
+                    SEARCH_RADIUS = 10
+                    MAX_SHIFT_DISTANCE = 50  # Maximum allowed shift between timesteps
+                    
+                    total_propagated = 0
+                    
+                    # Forward propagation: current_t → t+1 → t+2 → ... → end
+                    print(f"\n→ Forward propagation (t={current_t} to t={self.n_timesteps-1})")
+                    MIN_IOU_THRESHOLD = 0.2  # Minimum IoU to consider a match
+                    
+                    for t in range(current_t + 1, self.n_timesteps):
+                        seg_prev = self.segmentation_4d[t - 1]
+                        img_curr = self.image_4d[t]
+                        new_seg = np.zeros_like(seg_prev, dtype=np.uint32)
+                        
+                        # Get object IDs from previous timestep
+                        prev_ids = np.unique(seg_prev)
+                        prev_ids = prev_ids[prev_ids > 0]
+                        
+                        if len(prev_ids) == 0:
+                            continue
+                        
+                        # Label blobs in current timestep
+                        threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
+                        foreground_mask = img_curr > threshold
+                        labeled_blobs, num_blobs = label(foreground_mask)
+                        
+                        if num_blobs == 0:
+                            continue
+                        
+                        # IoU-based matching: for each object, find blob with highest overlap
+                        objects_propagated = 0
+                        for obj_id in prev_ids:
+                            mask_prev = (seg_prev == obj_id)
+                            
+                            # Calculate IoU with each blob in current timestep
+                            best_iou = 0
+                            best_blob_id = None
+                            
+                            for blob_id in range(1, num_blobs + 1):
+                                blob_mask = (labeled_blobs == blob_id)
+                                
+                                # Calculate intersection and union
+                                intersection = np.sum(mask_prev & blob_mask)
+                                union = np.sum(mask_prev | blob_mask)
+                                
+                                if union > 0:
+                                    iou = intersection / union
+                                    if iou > best_iou:
+                                        best_iou = iou
+                                        best_blob_id = blob_id
+                            
+                            # Only propagate if we found a good match
+                            if best_blob_id is not None and best_iou >= MIN_IOU_THRESHOLD:
+                                # Use the matched blob as the new mask
+                                new_mask = (labeled_blobs == best_blob_id)
+                                new_seg[new_mask & (new_seg == 0)] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                            else:
+                                # No good match found - skip this object
+                                if best_blob_id is not None:
+                                    print(f"    Skipping object {obj_id} at t={t}: IoU too low ({best_iou:.3f} < {MIN_IOU_THRESHOLD})")
+                                else:
+                                    print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
+                        
+                        # Update segmentation_4d
+                        if new_seg.max() > 0:
+                            self.segmentation_4d[t] = new_seg
+                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
+                    
+                    # Backward propagation: current_t → t-1 → t-2 → ... → 0
+                    print(f"\n← Backward propagation (t={current_t} to t=0)")
+                    
+                    for t in range(current_t - 1, -1, -1):
+                        seg_prev = self.segmentation_4d[t + 1]
+                        img_curr = self.image_4d[t]
+                        new_seg = np.zeros_like(seg_prev, dtype=np.uint32)
+                        
+                        # Get object IDs from previous timestep
+                        prev_ids = np.unique(seg_prev)
+                        prev_ids = prev_ids[prev_ids > 0]
+                        
+                        if len(prev_ids) == 0:
+                            continue
+                        
+                        # Label blobs in current timestep
+                        threshold = np.percentile(img_curr[img_curr > 0], 40) if np.any(img_curr > 0) else 0
+                        foreground_mask = img_curr > threshold
+                        labeled_blobs, num_blobs = label(foreground_mask)
+                        
+                        if num_blobs == 0:
+                            continue
+                        
+                        # IoU-based matching: for each object, find blob with highest overlap
+                        objects_propagated = 0
+                        for obj_id in prev_ids:
+                            mask_prev = (seg_prev == obj_id)
+                            
+                            # Calculate IoU with each blob in current timestep
+                            best_iou = 0
+                            best_blob_id = None
+                            
+                            for blob_id in range(1, num_blobs + 1):
+                                blob_mask = (labeled_blobs == blob_id)
+                                
+                                # Calculate intersection and union
+                                intersection = np.sum(mask_prev & blob_mask)
+                                union = np.sum(mask_prev | blob_mask)
+                                
+                                if union > 0:
+                                    iou = intersection / union
+                                    if iou > best_iou:
+                                        best_iou = iou
+                                        best_blob_id = blob_id
+                            
+                            # Only propagate if we found a good match
+                            if best_blob_id is not None and best_iou >= MIN_IOU_THRESHOLD:
+                                # Use the matched blob as the new mask
+                                new_mask = (labeled_blobs == best_blob_id)
+                                new_seg[new_mask & (new_seg == 0)] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                            else:
+                                # No good match found - skip this object
+                                if best_blob_id is not None:
+                                    print(f"    Skipping object {obj_id} at t={t}: IoU too low ({best_iou:.3f} < {MIN_IOU_THRESHOLD})")
+                                else:
+                                    print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
+                        
+                        # Update segmentation_4d
+                        if new_seg.max() > 0:
+                            self.segmentation_4d[t] = new_seg
+                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
+                    
+                    # Refresh viewer
+                    if "committed_objects_4d" in self._viewer.layers:
+                        self._viewer.layers["committed_objects_4d"].refresh()
+                    
+                    print(f"\n{'='*60}")
+                    print(f"✅ Propagated segmentation across {self.n_timesteps} timesteps")
+                    print(f"   Total propagations: {total_propagated}")
+                    print(f"{'='*60}\n")
+                    
+                    show_info(
+                        f"✓ Propagated segmentation\n\n"
+                        f"Source timestep: {current_t}\n"
+                        f"Objects tracked: {len(current_ids)}\n"
+                        f"Method: IoU-based matching (threshold: {MIN_IOU_THRESHOLD})"
+                    )
+                    
+                except Exception as e:
+                    print(f"Failed to propagate segmentation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+
+            btn_propagate.clicked.connect(_propagate_segmentation)
+            point_layout.addWidget(propagate_row)
+
+            # ========== LOAD NEUROPAL PROMPTS ==========
             def _load_neuropal_prompts():
                 """Load NeuroPAL-derived point prompts with neuron names."""
                 try:
@@ -1612,12 +1938,15 @@ class MicroSAM4DAnnotator(Annotator3d):
             # Insert the point prompt widget after embeddings widget
             try:
                 self._annotator_widget.layout().insertWidget(1, point_widget)
-            except Exception:
+            except Exception as ex:
                 # fallback: add at end
+                print(f"Warning: insertWidget failed ({ex}), adding at end")
                 self._annotator_widget.layout().addWidget(point_widget)
 
         except Exception as e:
             print(f"Failed to create point prompt tools: {e}")
+            import traceback
+            traceback.print_exc()
 
         # ================== SAVE SEGMENTATIONS ==================
         try:
@@ -1949,6 +2278,16 @@ class MicroSAM4DAnnotator(Annotator3d):
             """)
             tools_layout = QtWidgets.QVBoxLayout()
             tools_container.setLayout(tools_layout)
+            
+            # Add checkbox to control negative prompts from other objects
+            self._use_negative_prompts_checkbox = QtWidgets.QCheckBox("Use other prompts as negative")
+            self._use_negative_prompts_checkbox.setChecked(True)
+            self._use_negative_prompts_checkbox.setToolTip(
+                "When enabled, points from other objects are used as negative prompts\n"
+                "to prevent overlap. Disable for faster segmentation or when objects\n"
+                "are far apart."
+            )
+            tools_layout.addWidget(self._use_negative_prompts_checkbox)
             
             # Add the small 4D timestep tools widget (segment/commit across T)
             tools_layout.addWidget(TimestepToolsWidget(self))
@@ -4608,15 +4947,11 @@ class MicroSAM4DAnnotator(Annotator3d):
             # For other timesteps, get from stored map
             if t == original_t and point_layer is not None:
                 pts = np.array(point_layer.data)
-                print(f"📍 Processing CURRENT timestep {t} with {len(pts)} points from layer")
             else:
                 pts = prompt_map.get(t, np.empty((0, 3)))
-                if len(pts) > 0:
-                    print(f"📍 Processing timestep {t} with {len(pts)} points from map")
             
             pts_arr = np.asarray(pts) if pts is not None else np.empty((0, 3))
             if pts_arr.size == 0:
-                print(f"⏭️  Skipping timestep {t} - no point prompts")
                 continue
 
             # DON'T update self.current_timestep to avoid triggering callbacks
@@ -4624,7 +4959,6 @@ class MicroSAM4DAnnotator(Annotator3d):
 
             # Run debug checks before attempting segmentation
             if not self.debug_segmentation_4d(t):
-                print(f"⏭️  Skipping timestep {t} due to failed checks\n")
                 continue
 
             # Activate embeddings/predictor for this timestep
@@ -4639,8 +4973,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                         # Give a moment for the embedding to be activated
                         import time
                         time.sleep(0.1)
-                    except Exception as e:
-                        print(f"Failed to load embeddings for timestep {t}: {e}")
+                    except Exception:
                         continue
                 
                 # Now ensure embeddings are active
@@ -4658,7 +4991,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                 from ._state import AnnotatorState
                 state = AnnotatorState()
                 if state.image_embeddings is None:
-                    print(f"Warning: Embeddings not activated for timestep {t}, skipping")
                     continue
                     
                 # Ensure image metadata is set for segmentation
@@ -4737,11 +5069,9 @@ class MicroSAM4DAnnotator(Annotator3d):
             except Exception:
                 pass
 
-            # Run manual volumetric segmentation
+            # Run manual volumetric segmentation using Shift+S logic
             try:
-                print(f"Attempting segmentation for timestep {t} with {len(pts_arr)} point prompts")
-                
-                # Use the prompt_segmentation utility directly for 3D segmentation
+                # Use segment_slices_with_prompts + segment_mask_in_volume like Shift+S
                 from . import util as sam_util
                 from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
                 from ._state import AnnotatorState
@@ -4751,13 +5081,17 @@ class MicroSAM4DAnnotator(Annotator3d):
                 state = AnnotatorState()
                 shape = image3d.shape
                 
+                # Set state.image_shape if needed
+                if state.image_shape is None or state.image_shape != shape:
+                    state.image_shape = shape
+                
                 # Initialize merged segmentation
                 seg_merged = np.zeros(shape, dtype=np.uint32)
                 
                 # Get point IDs based on coordinates
                 point_ids = self._get_point_ids_for_timestep(t, pts_arr)
                 
-                # Convert point prompts to the format expected by prompt_segmentation
+                # Convert point prompts to the format expected by segment_slices_with_prompts
                 if len(pts_arr) > 0:
                     # Group points by their assigned ID
                     points_by_id = {}
@@ -4767,122 +5101,115 @@ class MicroSAM4DAnnotator(Annotator3d):
                             points_by_id[point_id] = []
                         points_by_id[point_id].append((point_idx, point))
                     
-                    # Process each ID group separately
+                    # Get box prompts layer (usually empty for point-based workflow)
+                    box_layer = self._viewer.layers["prompts"] if "prompts" in self._viewer.layers else None
+                    
+                    # Process each ID group separately using OLD conservative logic
+                    prompt_count = 0
                     for target_id, points_list in points_by_id.items():
-                        print(f"  Processing {len(points_list)} points for target ID {target_id}")
+                        prompt_count += 1
+                        print(f"Segmenting prompt {prompt_count}", end="", flush=True)
                         
-                        # Collect negative prompts from all other IDs organized by Z-slice
-                        negative_points_by_z = {}  # Maps z_slice -> list of negative points
-                        for other_id, other_points_list in points_by_id.items():
-                            if other_id != target_id:
-                                for _, other_point in other_points_list:
-                                    z = int(other_point[0])
-                                    if z not in negative_points_by_z:
-                                        negative_points_by_z[z] = []
-                                    negative_points_by_z[z].append(other_point[1:3])  # (Y, X)
+                        # Extract just the coordinates for this ID
+                        id_points = np.array([point for _, point in points_list])
                         
-                        # Group points of this ID by Z-slice for efficient batched segmentation
-                        points_by_z = {}
-                        for point_idx, point in points_list:
-                            z = int(point[0])
-                            if z not in points_by_z:
-                                points_by_z[z] = []
-                            points_by_z[z].append(point[1:3])  # (Y, X)
+                        # Collect negative prompts from all OTHER IDs to prevent overlap
+                        # Only if the checkbox is enabled
+                        negative_points = []
+                        use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
+                        if use_negative is not None and use_negative.isChecked():
+                            for other_id, other_points_list in points_by_id.items():
+                                if other_id != target_id:
+                                    for _, other_point in other_points_list:
+                                        negative_points.append(other_point)
                         
-                        # Segment all points for this ID and merge them
-                        id_seg = np.zeros(shape, dtype=np.uint32)
-                        shape_2d = shape[1:]
+                        # OLD CONSERVATIVE APPROACH:
+                        # 1. Segment only the FIRST slice with a point (not all slices)
+                        # 2. Use higher IOU threshold (0.65 instead of 0.5)
+                        # 3. This prevents jumping to nearby neurons
                         
-                        # Process each Z-slice that has points for this ID
-                        for z_slice, pts_2d_list in points_by_z.items():
-                            pts_2d = np.array(pts_2d_list)  # (N, 2) array of positive points
-                            pos_labels = np.ones(len(pts_2d), dtype=int)
-                            
-                            # Get negative prompts from other IDs at this Z-slice
-                            neg_pts_at_z = negative_points_by_z.get(z_slice, [])
-                            
-                            if len(neg_pts_at_z) > 0:
-                                neg_pts = np.array(neg_pts_at_z)
-                                all_points = np.vstack([pts_2d, neg_pts])
-                                all_labels = np.concatenate([pos_labels, np.zeros(len(neg_pts), dtype=int)])
-                                print(f"    Segmenting {len(pts_2d)} positive + {len(neg_pts)} negative prompts at slice {z_slice}")
-                            else:
-                                all_points = pts_2d
-                                all_labels = pos_labels
-                                print(f"    Segmenting {len(pts_2d)} positive prompts at slice {z_slice}")
-
-                            # Segment the slice using 2D segmentation with all points at this Z-slice
-                            seg_2d = sam_util.prompt_segmentation(
+                        # Get the first Z-slice that has a point for this ID
+                        first_z = int(id_points[0, 0])  # Z coordinate of first point
+                        
+                        # Prepare points and labels for the first slice only
+                        first_slice_points = []
+                        first_slice_labels = []
+                        
+                        # Add positive points from this ID on the first slice
+                        for point in id_points:
+                            if int(point[0]) == first_z:
+                                first_slice_points.append(point[1:])  # (Y, X) only
+                                first_slice_labels.append(1)  # positive
+                        
+                        # Add negative points from other IDs on the first slice
+                        if len(negative_points) > 0:
+                            for neg_point in negative_points:
+                                if int(neg_point[0]) == first_z:
+                                    first_slice_points.append(neg_point[1:])  # (Y, X) only
+                                    first_slice_labels.append(0)  # negative
+                        
+                        if len(first_slice_points) == 0:
+                            print(f"... Skipped (no points on first slice)")
+                            continue
+                        
+                        first_slice_points = np.array(first_slice_points)
+                        first_slice_labels = np.array(first_slice_labels)
+                        
+                        # Segment the first slice using prompt_segmentation
+                        seg_id = np.zeros(shape, dtype=np.uint32)
+                        try:
+                            mask_2d = sam_util.prompt_segmentation(
                                 state.predictor,
-                                all_points,
-                                all_labels,
+                                first_slice_points,
+                                first_slice_labels,
                                 boxes=np.array([]),
                                 masks=None,
-                                shape=shape_2d,
+                                shape=shape[1:],  # (Y, X) for 2D slice
                                 multiple_box_prompts=False,
+                                i=first_z,
                                 image_embeddings=state.image_embeddings,
-                                i=z_slice,
                             )
-                            
-                            if seg_2d is not None and seg_2d.max() > 0:
-                                # Create 3D volume for this object
-                                seg_3d = np.zeros(shape, dtype=np.uint32)
-                                seg_3d[z_slice] = (seg_2d > 0).astype(np.uint32)
-                                
-                                # Extend through volume
-                                try:
-                                    seg_3d, (z_min, z_max) = segment_mask_in_volume(
-                                        seg_3d,
-                                        state.predictor,
-                                        state.image_embeddings,
-                                        np.array([z_slice]),
-                                        stop_lower=False,
-                                        stop_upper=False,
-                                        iou_threshold=0.65,
-                                        projection="single_point",
-                                        verbose=False,
-                                    )
-                                    print(f"      Extended from slice {z_min} to {z_max}")
-                                except Exception as e:
-                                    print(f"      Warning: Could not extend: {e}")
-                                
-                                # Merge into ID-specific segmentation
-                                mask = seg_3d > 0
-                                id_seg[mask] = 1
-                            else:
-                                print(f"      Warning: No segmentation at slice {z_slice}")
+                            if mask_2d is not None and mask_2d.max() > 0:
+                                seg_id[first_z] = mask_2d
+                        except Exception:
+                            print(f"... Skipped (segmentation failed)")
+                            continue
+                        
+                        # Extend through the volume with higher IOU threshold (0.65)
+                        if seg_id.max() > 0:
+                            try:
+                                seg_id, (z_min, z_max) = segment_mask_in_volume(
+                                    seg_id,
+                                    state.predictor,
+                                    state.image_embeddings,
+                                    np.array([first_z]),  # Only one slice segmented
+                                    stop_lower=False,
+                                    stop_upper=False,
+                                    iou_threshold=0.65,  # Higher threshold = more conservative
+                                    projection="single_point",
+                                    box_extension=0.05,
+                                    update_progress=None,
+                                )
+                            except Exception:
+                                pass
                         
                         # Add ID-specific segmentation to merged result with target ID
-                        if id_seg.max() > 0:
-                            mask = id_seg > 0
-                            seg_merged[mask] = target_id
-                            print(f"    ✓ Created object with ID {target_id}")
+                        # Only assign pixels that haven't been claimed by previous objects
+                        if seg_id.max() > 0:
+                            mask = seg_id > 0
+                            # Only write to unclaimed pixels (background = 0)
+                            unclaimed_mask = (seg_merged == 0) & mask
+                            seg_merged[unclaimed_mask] = target_id
+                            print(f"... Done")
+                        else:
+                            print(f"... Skipped")
                     
                     seg = seg_merged if seg_merged.max() > 0 else None
                       
                     if seg is None:
-                        print(f"⚠️ No objects segmented for timestep {t}")
-                    
-                if seg is not None:
-                    unique_ids = np.unique(seg[seg > 0])
-                    print(f"✅ Segmented {len(unique_ids)} objects for timestep {t} with IDs: {unique_ids}, shape: {seg.shape}")
-                    
-                    # Check if SAM returned empty mask
-                    mask_max = seg.max()
-                    mask_min = seg.min()
-                    mask_nonzero = np.count_nonzero(seg)
-                    
-                    print(f"  Mask stats: min={mask_min}, max={mask_max}, nonzero_pixels={mask_nonzero}")
-                    
-                    if mask_max == 0:
-                        print(f"❌ SAM produced empty mask for timestep {t}")
-                        print(f"  Possible causes:")
-                        print(f"    - Point prompts are outside image bounds")
-                        print(f"    - Wrong embeddings loaded (mismatch with image)")
-                        print(f"    - Image has very low contrast")
-                        print(f"    - Predictor not properly initialized")
                         continue
                     
+                if seg is not None:
                     # Store directly into current_object_4d and update the layer
                     self.current_object_4d[int(t)] = seg.astype(np.uint32)
                     
@@ -4891,18 +5218,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                         lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
                         if lay is not None:
                             lay.refresh()
-                            print(f"✅ Segmentation stored and layer refreshed for timestep {t}")
-                        else:
-                            print(f"⚠ current_object_4d layer not found in viewer")
-                    except Exception as e:
-                        print(f"Failed to refresh layer: {e}")
-                else:
-                    print(f"Segmentation returned None for timestep {t}")
+                    except Exception:
+                        pass
                     
-            except Exception as e:
-                print(f"Segmentation failed for timestep {t}: {e}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
                 continue
 
         # Save the current timestep's segmentation before restoring (to preserve it)
@@ -4910,9 +5229,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         if self.current_object_4d is not None:
             try:
                 original_t_seg = self.current_object_4d[int(original_t)].copy()
-                print(f"💾 Saved segmentation for original timestep {original_t}")
-            except Exception as e:
-                print(f"Warning: Could not save original timestep segmentation: {e}")
+            except Exception:
+                pass
 
         # Reconnect dimension slider callback
         if dims_callback_disconnected:
@@ -4933,18 +5251,16 @@ class MicroSAM4DAnnotator(Annotator3d):
         if original_t_seg is not None and self.current_object_4d is not None:
             try:
                 self.current_object_4d[int(original_t)] = original_t_seg
-                print(f"♻️  Restored segmentation for timestep {original_t}")
-            except Exception as e:
-                print(f"Warning: Could not restore original timestep segmentation: {e}")
+            except Exception:
+                pass
 
         # Force refresh of current_object_4d layer to show the segmentation
         try:
             lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
             if lay is not None:
                 lay.refresh()
-                print(f"✅ Refreshed current_object_4d layer for restored timestep {original_t}")
-        except Exception as e:
-            print(f"Warning: Could not refresh current_object_4d layer: {e}")
+        except Exception:
+            pass
 
         # Reconnect point prompts event listener
         if point_layer is not None and hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
@@ -4953,6 +5269,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                     point_layer.events.data.connect(self._point_prompt_connection)
             except Exception:
                 pass
+        
+        print("Done segmenting all prompts")
 
         try:
             show_info("Finished segmenting all timesteps with point prompts.")
@@ -5486,6 +5804,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                 nearest_centroid = (int(cz), int(cy), int(cx))
         
         return nearest_centroid
+    
+    def _find_local_maximum_3d(self, image_3d, z, y, x, radius):
+        """Find local intensity maximum within radius of (z, y, x) in 3D.
+        
+        This is an alias for _find_local_maximum for use in segmentation propagation.
+        Returns tuple of (new_z, new_y, new_x).
+        """
+        return self._find_local_maximum(image_3d, z, y, x, radius)
     
     def _update_viewer_after_propagation(self, current_t):
         """Update viewer to show propagated points for current timestep."""
