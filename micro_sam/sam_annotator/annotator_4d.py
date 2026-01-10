@@ -358,16 +358,13 @@ class TimestepToolsWidget(QtWidgets.QWidget):
 
         btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
         btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
-        btn_segment_propagate = QtWidgets.QPushButton("Segment + Propagate across time")
         btn_propagate_points = QtWidgets.QPushButton("Propagate point prompts to all timesteps")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
-        btn_segment_propagate.clicked.connect(lambda: self._safe_call(self._annotator.segment_and_propagate_all_timesteps))
         btn_propagate_points.clicked.connect(lambda: self._safe_call(self._annotator.propagate_point_prompts_to_all_timesteps))
 
         layout.addWidget(btn_segment)
-        layout.addWidget(btn_segment_propagate)
         layout.addWidget(btn_commit)
         layout.addWidget(btn_propagate_points)
         
@@ -881,7 +878,22 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             self.timestep_embedding_manager = None
 
-                # Add small embedding controls to the annotator dock (Compute embeddings current/all T)
+        # Hide/remove unwanted base class UI widgets
+        try:
+            # The base class creates self._annotator_widget with various UI sections
+            # We'll hide the ones we don't need for 4D annotation
+            if hasattr(self, '_annotator_widget'):
+                layout = self._annotator_widget.layout()
+                if layout is not None:
+                    # Remove all existing widgets from base class
+                    while layout.count():
+                        item = layout.takeAt(0)
+                        if item.widget():
+                            item.widget().deleteLater()
+        except Exception as e:
+            print(f"Failed to clean base class widgets: {e}")
+
+        # Add small embedding controls to the annotator dock (Compute embeddings current/all T)
         try:
             emb_widget = QtWidgets.QGroupBox("EMBEDDINGS TOOLS")
             emb_widget.setStyleSheet("""
@@ -1639,7 +1651,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
                     print(f"\n→ Forward propagation (t={current_t} to t={self.n_timesteps-1})")
-                    MIN_IOU_THRESHOLD = 0.2  # Minimum IoU to consider a match
+                    MIN_IOU_THRESHOLD = 0.3  # Minimum IoU to consider a match
                     
                     for t in range(current_t + 1, self.n_timesteps):
                         seg_prev = self.segmentation_4d[t - 1]
@@ -1718,7 +1730,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                             continue
                         
                         # Label blobs in current timestep
-                        threshold = np.percentile(img_curr[img_curr > 0], 40) if np.any(img_curr > 0) else 0
+                        threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
                         foreground_mask = img_curr > threshold
                         labeled_blobs, num_blobs = label(foreground_mask)
                         
@@ -2164,7 +2176,41 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             # don't fail initialization if Qt isn't available
             pass
-
+    
+    def _create_keybindings(self):
+        """Override base class keybindings with 4D-specific shortcuts.
+        
+        4D annotator keybindings:
+        - Shift+S: Segment all objects across timesteps
+        - Shift+P: Segment + Propagate current segmentation across time
+        - C: Commit all timesteps
+        """
+        @self._viewer.bind_key("Shift-S", overwrite=True)
+        def _segment_all_timesteps(viewer):
+            try:
+                self.segment_all_timesteps()
+            except Exception as e:
+                print(f"Error in segment_all_timesteps: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        @self._viewer.bind_key("Shift-P", overwrite=True)
+        def _segment_and_propagate(viewer):
+            try:
+                self.segment_and_propagate_all_timesteps()
+            except Exception as e:
+                print(f"Error in segment_and_propagate_all_timesteps: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        @self._viewer.bind_key("c", overwrite=True)
+        def _commit_all_timesteps(viewer):
+            try:
+                self.commit_all_timesteps()
+            except Exception as e:
+                print(f"Error in commit_all_timesteps: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _reorder_layers(self):
         """Reorder layers according to desired order and persist across timestep changes."""
