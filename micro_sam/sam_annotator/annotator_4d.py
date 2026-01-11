@@ -1650,7 +1650,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                     total_propagated = 0
                     
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
-                    print(f"\n→ Forward propagation (t={current_t} to t={self.n_timesteps-1})")
                     MIN_IOU_THRESHOLD = 0.3  # Minimum IoU to consider a match
                     
                     for t in range(current_t + 1, self.n_timesteps):
@@ -1713,10 +1712,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                         # Update segmentation_4d
                         if new_seg.max() > 0:
                             self.segmentation_4d[t] = new_seg
-                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
                     
                     # Backward propagation: current_t → t-1 → t-2 → ... → 0
-                    print(f"\n← Backward propagation (t={current_t} to t=0)")
                     
                     for t in range(current_t - 1, -1, -1):
                         seg_prev = self.segmentation_4d[t + 1]
@@ -1778,7 +1775,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                         # Update segmentation_4d
                         if new_seg.max() > 0:
                             self.segmentation_4d[t] = new_seg
-                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
                     
                     # Refresh viewer
                     if "committed_objects_4d" in self._viewer.layers:
