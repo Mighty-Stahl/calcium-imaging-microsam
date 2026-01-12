@@ -5201,110 +5201,112 @@ class MicroSAM4DAnnotator(Annotator3d):
                     # Get box prompts layer (usually empty for point-based workflow)
                     box_layer = self._viewer.layers["prompts"] if "prompts" in self._viewer.layers else None
                     
-                    # Process each ID group separately using OLD conservative logic
-                    prompt_count = 0
-                    for target_id, points_list in points_by_id.items():
-                        prompt_count += 1
-                        print(f"Segmenting prompt {prompt_count}", end="", flush=True)
+                # Process each ID group separately - NEW APPROACH: Segment ALL slices with points
+                prompt_count = 0
+                for target_id, points_list in points_by_id.items():
+                    prompt_count += 1
+                    print(f"Segmenting prompt {prompt_count}", end="", flush=True)
+                    
+                    # Extract just the coordinates for this ID
+                    id_points = np.array([point for _, point in points_list])
+                    
+                    # Collect negative prompts from all OTHER IDs to prevent overlap
+                    # Only if the checkbox is enabled
+                    negative_points = []
+                    use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
+                    if use_negative is not None and use_negative.isChecked():
+                        for other_id, other_points_list in points_by_id.items():
+                            if other_id != target_id:
+                                for _, other_point in other_points_list:
+                                    negative_points.append(other_point)
+                    
+                    # NEW APPROACH: Segment ALL slices that have points (not just the first one)
+                    # Group points by Z-slice
+                    points_by_z = {}
+                    for point in id_points:
+                        z = int(point[0])
+                        if z not in points_by_z:
+                            points_by_z[z] = []
+                        points_by_z[z].append(point[1:])  # Store (Y, X) only
+                    
+                    # Also group negative points by Z-slice
+                    negative_by_z = {}
+                    if len(negative_points) > 0:
+                        for neg_point in negative_points:
+                            z = int(neg_point[0])
+                            if z not in negative_by_z:
+                                negative_by_z[z] = []
+                            negative_by_z[z].append(neg_point[1:])  # Store (Y, X) only
+                    
+                    # Segment each Z-slice that has points for this ID
+                    seg_id = np.zeros(shape, dtype=np.uint32)
+                    segmented_slices = []
+                    
+                    for z, pos_points in points_by_z.items():
+                        # Combine positive and negative points for this slice
+                        slice_points = pos_points.copy()
+                        slice_labels = [1] * len(pos_points)  # positive labels
                         
-                        # Extract just the coordinates for this ID
-                        id_points = np.array([point for _, point in points_list])
+                        # Add negative points from other IDs on this slice
+                        if z in negative_by_z:
+                            slice_points.extend(negative_by_z[z])
+                            slice_labels.extend([0] * len(negative_by_z[z]))  # negative labels
                         
-                        # Collect negative prompts from all OTHER IDs to prevent overlap
-                        # Only if the checkbox is enabled
-                        negative_points = []
-                        use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
-                        if use_negative is not None and use_negative.isChecked():
-                            for other_id, other_points_list in points_by_id.items():
-                                if other_id != target_id:
-                                    for _, other_point in other_points_list:
-                                        negative_points.append(other_point)
+                        slice_points = np.array(slice_points)
+                        slice_labels = np.array(slice_labels)
                         
-                        # OLD CONSERVATIVE APPROACH:
-                        # 1. Segment only the FIRST slice with a point (not all slices)
-                        # 2. Use higher IOU threshold (0.65 instead of 0.5)
-                        # 3. This prevents jumping to nearby neurons
-                        
-                        # Get the first Z-slice that has a point for this ID
-                        first_z = int(id_points[0, 0])  # Z coordinate of first point
-                        
-                        # Prepare points and labels for the first slice only
-                        first_slice_points = []
-                        first_slice_labels = []
-                        
-                        # Add positive points from this ID on the first slice
-                        for point in id_points:
-                            if int(point[0]) == first_z:
-                                first_slice_points.append(point[1:])  # (Y, X) only
-                                first_slice_labels.append(1)  # positive
-                        
-                        # Add negative points from other IDs on the first slice
-                        if len(negative_points) > 0:
-                            for neg_point in negative_points:
-                                if int(neg_point[0]) == first_z:
-                                    first_slice_points.append(neg_point[1:])  # (Y, X) only
-                                    first_slice_labels.append(0)  # negative
-                        
-                        if len(first_slice_points) == 0:
-                            print(f"... Skipped (no points on first slice)")
-                            continue
-                        
-                        first_slice_points = np.array(first_slice_points)
-                        first_slice_labels = np.array(first_slice_labels)
-                        
-                        # Segment the first slice using prompt_segmentation
-                        seg_id = np.zeros(shape, dtype=np.uint32)
+                        # Segment this slice
                         try:
                             mask_2d = sam_util.prompt_segmentation(
                                 state.predictor,
-                                first_slice_points,
-                                first_slice_labels,
+                                slice_points,
+                                slice_labels,
                                 boxes=np.array([]),
                                 masks=None,
                                 shape=shape[1:],  # (Y, X) for 2D slice
                                 multiple_box_prompts=False,
-                                i=first_z,
+                                i=z,
                                 image_embeddings=state.image_embeddings,
                             )
                             if mask_2d is not None and mask_2d.max() > 0:
-                                seg_id[first_z] = mask_2d
+                                seg_id[z] = mask_2d
+                                segmented_slices.append(z)
                         except Exception:
-                            print(f"... Skipped (segmentation failed)")
-                            continue
-                        
-                        # Extend through the volume with higher IOU threshold (0.65)
-                        if seg_id.max() > 0:
-                            try:
-                                seg_id, (z_min, z_max) = segment_mask_in_volume(
-                                    seg_id,
-                                    state.predictor,
-                                    state.image_embeddings,
-                                    np.array([first_z]),  # Only one slice segmented
-                                    stop_lower=False,
-                                    stop_upper=False,
-                                    iou_threshold=0.65,  # Higher threshold = more conservative
-                                    projection="single_point",
-                                    box_extension=0.05,
-                                    update_progress=None,
-                                )
-                            except Exception:
-                                pass
-                        
-                        # Add ID-specific segmentation to merged result with target ID
-                        # Only assign pixels that haven't been claimed by previous objects
-                        if seg_id.max() > 0:
-                            mask = seg_id > 0
-                            # Only write to unclaimed pixels (background = 0)
-                            unclaimed_mask = (seg_merged == 0) & mask
-                            seg_merged[unclaimed_mask] = target_id
-                            print(f"... Done")
-                        else:
-                            print(f"... Skipped")
+                            pass
                     
-                    seg = seg_merged if seg_merged.max() > 0 else None
-                      
-                    if seg is None:
-                        continue
+                    # Extend through the volume using all segmented slices as anchors
+                    if len(segmented_slices) > 0:
+                        try:
+                            seg_id, (z_min, z_max) = segment_mask_in_volume(
+                                seg_id,
+                                state.predictor,
+                                state.image_embeddings,
+                                np.array(segmented_slices),  # Use ALL segmented slices
+                                stop_lower=False,
+                                stop_upper=False,
+                                iou_threshold=0.65,  # Higher threshold = more conservative
+                                projection="single_point",
+                                box_extension=0.05,
+                                update_progress=None,
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Add ID-specific segmentation to merged result with target ID
+                    # Only assign pixels that haven't been claimed by previous objects
+                    if seg_id.max() > 0:
+                        mask = seg_id > 0
+                        # Only write to unclaimed pixels (background = 0)
+                        unclaimed_mask = (seg_merged == 0) & mask
+                        seg_merged[unclaimed_mask] = target_id
+                        print(f"... Done")
+                    else:
+                        print(f"... Skipped")
+                
+                seg = seg_merged if seg_merged.max() > 0 else None
+                  
+                if seg is None:
+                    continue
                     
                 if seg is not None:
                     # Store directly into current_object_4d and update the layer
