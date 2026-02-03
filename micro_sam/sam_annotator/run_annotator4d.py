@@ -70,7 +70,10 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "/Users/arnlois/data/code/cropped2_sub-20190928-13_ses-20190928_ophys_calcium.npz"
+    default_npz_path = "/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz"
+
+# "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
+
 
     if image4d is None:
         print(f"Loading default NPZ from: {default_npz_path}")
@@ -100,7 +103,15 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:100]
+    image4d = image4d[1:900]
+    
+    #    image4d = image4d[10:900]
+    
+        # Convert to float like 4d_image_inspector for consistent display
+    image4d = image4d.astype(float)
+    print(f"Converted to float: dtype={image4d.dtype}")
+
+
     print(f"Trimmed: new shape = {image4d.shape}")
 
     # create Napari viewer and annotator
@@ -117,6 +128,16 @@ def main(argv=None):
     # avoid copying large data where possible. The annotator will create
     # persistent 4D layers referencing this array.
     annot.update_image(image4d)
+    try:
+        raw_layer = viewer.layers["raw_4d"]
+        nonzero = image4d[image4d > 0]
+        if len(nonzero) > 0:
+            vmin = 0  # or np.percentile(nonzero, 1)
+            vmax = np.percentile(nonzero, 99.5)
+            raw_layer.contrast_limits = [vmin, vmax]
+            print(f"Set contrast limits: [{vmin:.1f}, {vmax:.1f}]")
+    except Exception as e:
+        print(f"Could not set contrast: {e}")
 
     print("🤩 Viewer Loaded 🤩")
 

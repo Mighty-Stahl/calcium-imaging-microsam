@@ -356,18 +356,15 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout()
         self.setLayout(layout)
 
-        btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
-        btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
-        btn_segment_propagate = QtWidgets.QPushButton("Segment + Propagate across time")
+        btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps (Shift+S)")
+        btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps (C)")
         btn_propagate_points = QtWidgets.QPushButton("Propagate point prompts to all timesteps")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
-        btn_segment_propagate.clicked.connect(lambda: self._safe_call(self._annotator.segment_and_propagate_all_timesteps))
         btn_propagate_points.clicked.connect(lambda: self._safe_call(self._annotator.propagate_point_prompts_to_all_timesteps))
 
         layout.addWidget(btn_segment)
-        layout.addWidget(btn_segment_propagate)
         layout.addWidget(btn_commit)
         layout.addWidget(btn_propagate_points)
         
@@ -881,7 +878,22 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             self.timestep_embedding_manager = None
 
-                # Add small embedding controls to the annotator dock (Compute embeddings current/all T)
+        # Hide/remove unwanted base class UI widgets
+        try:
+            # The base class creates self._annotator_widget with various UI sections
+            # We'll hide the ones we don't need for 4D annotation
+            if hasattr(self, '_annotator_widget'):
+                layout = self._annotator_widget.layout()
+                if layout is not None:
+                    # Remove all existing widgets from base class
+                    while layout.count():
+                        item = layout.takeAt(0)
+                        if item.widget():
+                            item.widget().deleteLater()
+        except Exception as e:
+            print(f"Failed to clean base class widgets: {e}")
+
+        # Add small embedding controls to the annotator dock (Compute embeddings current/all T)
         try:
             emb_widget = QtWidgets.QGroupBox("EMBEDDINGS TOOLS")
             emb_widget.setStyleSheet("""
@@ -1598,7 +1610,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             propagate_label = QtWidgets.QLabel("<b>Propagate Segmentation</b>")
             propagate_layout.addWidget(propagate_label)
 
-            btn_propagate = QtWidgets.QPushButton("Propagate Current Segmentation")
+            btn_propagate = QtWidgets.QPushButton("Propagate Current Segmentation (Shift+P)")
             btn_propagate.setToolTip("Track objects across timesteps using centroid matching")
             propagate_layout.addWidget(btn_propagate)
 
@@ -1638,7 +1650,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                     total_propagated = 0
                     
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
-                    print(f"\n→ Forward propagation (t={current_t} to t={self.n_timesteps-1})")
+                    MIN_IOU_THRESHOLD = 0.3  # Minimum IoU to consider a match
+                    
                     for t in range(current_t + 1, self.n_timesteps):
                         seg_prev = self.segmentation_4d[t - 1]
                         img_curr = self.image_4d[t]
@@ -1651,76 +1664,57 @@ class MicroSAM4DAnnotator(Annotator3d):
                         if len(prev_ids) == 0:
                             continue
                         
-                        # Smooth image for better peak detection
-                        smoothed = maximum_filter(img_curr, size=3)
-                        
-                        # Label blobs in current timestep to constrain search
+                        # Label blobs in current timestep
                         threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
                         foreground_mask = img_curr > threshold
-                        labeled_blobs, _ = label(foreground_mask)
+                        labeled_blobs, num_blobs = label(foreground_mask)
                         
-                        # For each object, find local maximum constrained to same blob
+                        if num_blobs == 0:
+                            continue
+                        
+                        # IoU-based matching: for each object, find blob with highest overlap
                         objects_propagated = 0
                         for obj_id in prev_ids:
                             mask_prev = (seg_prev == obj_id)
-                            centroid_prev = np.array(center_of_mass(mask_prev))
                             
-                            # Find which blob the centroid falls into in current timestep
-                            cz, cy, cx = int(centroid_prev[0]), int(centroid_prev[1]), int(centroid_prev[2])
-                            cz = max(0, min(cz, labeled_blobs.shape[0] - 1))
-                            cy = max(0, min(cy, labeled_blobs.shape[1] - 1))
-                            cx = max(0, min(cx, labeled_blobs.shape[2] - 1))
-                            current_blob_id = labeled_blobs[cz, cy, cx]
+                            # Calculate IoU with each blob in current timestep
+                            best_iou = 0
+                            best_blob_id = None
                             
-                            # If centroid falls in background, find nearest blob
-                            if current_blob_id == 0:
-                                num_blobs = labeled_blobs.max()
-                                if num_blobs > 0:
-                                    # Find nearest blob centroid
-                                    min_dist = float('inf')
-                                    for blob_id in range(1, num_blobs + 1):
-                                        blob_mask = (labeled_blobs == blob_id)
-                                        blob_centroid = np.array(center_of_mass(blob_mask))
-                                        dist = np.linalg.norm(blob_centroid - centroid_prev)
-                                        if dist < min_dist:
-                                            min_dist = dist
-                                            current_blob_id = blob_id
+                            for blob_id in range(1, num_blobs + 1):
+                                blob_mask = (labeled_blobs == blob_id)
+                                
+                                # Calculate intersection and union
+                                intersection = np.sum(mask_prev & blob_mask)
+                                union = np.sum(mask_prev | blob_mask)
+                                
+                                if union > 0:
+                                    iou = intersection / union
+                                    if iou > best_iou:
+                                        best_iou = iou
+                                        best_blob_id = blob_id
                             
-                            # Find local maximum constrained to the same blob
-                            new_z, new_y, new_x, found_in_blob = self._find_local_maximum_in_blob(
-                                smoothed, 
-                                labeled_blobs,
-                                cz, cy, cx,
-                                SEARCH_RADIUS,
-                                current_blob_id
-                            )
-                            
-                            # Calculate shift vector
-                            new_centroid = np.array([new_z, new_y, new_x])
-                            shift_vector = new_centroid - centroid_prev
-                            shift_distance = np.linalg.norm(shift_vector)
-                            
-                            # Only propagate if shift is reasonable (relax found_in_blob requirement)
-                            if shift_distance > MAX_SHIFT_DISTANCE:
-                                print(f"    Skipping object {obj_id} at t={t}: shift too large ({shift_distance:.1f} > {MAX_SHIFT_DISTANCE})")
-                                continue
-                            
-                            # Translate the mask
-                            shifted_mask = shift(mask_prev.astype(float), shift_vector, order=0, mode='constant', cval=0)
-                            shifted_mask = (shifted_mask > 0.5)
-                            
-                            # Add to new segmentation (first-come-first-served, no overwriting)
-                            new_seg[shifted_mask & (new_seg == 0)] = obj_id
-                            objects_propagated += 1
-                            total_propagated += 1
+                            # Propagate with best match found (fallback to low IOU if necessary)
+                            if best_blob_id is not None:
+                                # Use the matched blob as the new mask
+                                new_mask = (labeled_blobs == best_blob_id)
+                                new_seg[new_mask & (new_seg == 0)] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                                
+                                # Warn if IOU is below normal threshold
+                                if best_iou < MIN_IOU_THRESHOLD:
+                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
+                            else:
+                                # No overlapping blobs found at all - truly skip
+                                print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
                         
                         # Update segmentation_4d
                         if new_seg.max() > 0:
                             self.segmentation_4d[t] = new_seg
-                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
                     
                     # Backward propagation: current_t → t-1 → t-2 → ... → 0
-                    print(f"\n← Backward propagation (t={current_t} to t=0)")
+                    
                     for t in range(current_t - 1, -1, -1):
                         seg_prev = self.segmentation_4d[t + 1]
                         img_curr = self.image_4d[t]
@@ -1733,73 +1727,54 @@ class MicroSAM4DAnnotator(Annotator3d):
                         if len(prev_ids) == 0:
                             continue
                         
-                        # Smooth image for better peak detection
-                        smoothed = maximum_filter(img_curr, size=3)
-                        
-                        # Label blobs in current timestep to constrain search
+                        # Label blobs in current timestep
                         threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
                         foreground_mask = img_curr > threshold
-                        labeled_blobs, _ = label(foreground_mask)
+                        labeled_blobs, num_blobs = label(foreground_mask)
                         
-                        # For each object, find local maximum constrained to same blob
+                        if num_blobs == 0:
+                            continue
+                        
+                        # IoU-based matching: for each object, find blob with highest overlap
                         objects_propagated = 0
                         for obj_id in prev_ids:
                             mask_prev = (seg_prev == obj_id)
-                            centroid_prev = np.array(center_of_mass(mask_prev))
                             
-                            # Find which blob the centroid falls into in current timestep
-                            cz, cy, cx = int(centroid_prev[0]), int(centroid_prev[1]), int(centroid_prev[2])
-                            cz = max(0, min(cz, labeled_blobs.shape[0] - 1))
-                            cy = max(0, min(cy, labeled_blobs.shape[1] - 1))
-                            cx = max(0, min(cx, labeled_blobs.shape[2] - 1))
-                            current_blob_id = labeled_blobs[cz, cy, cx]
+                            # Calculate IoU with each blob in current timestep
+                            best_iou = 0
+                            best_blob_id = None
                             
-                            # If centroid falls in background, find nearest blob
-                            if current_blob_id == 0:
-                                num_blobs = labeled_blobs.max()
-                                if num_blobs > 0:
-                                    # Find nearest blob centroid
-                                    min_dist = float('inf')
-                                    for blob_id in range(1, num_blobs + 1):
-                                        blob_mask = (labeled_blobs == blob_id)
-                                        blob_centroid = np.array(center_of_mass(blob_mask))
-                                        dist = np.linalg.norm(blob_centroid - centroid_prev)
-                                        if dist < min_dist:
-                                            min_dist = dist
-                                            current_blob_id = blob_id
+                            for blob_id in range(1, num_blobs + 1):
+                                blob_mask = (labeled_blobs == blob_id)
+                                
+                                # Calculate intersection and union
+                                intersection = np.sum(mask_prev & blob_mask)
+                                union = np.sum(mask_prev | blob_mask)
+                                
+                                if union > 0:
+                                    iou = intersection / union
+                                    if iou > best_iou:
+                                        best_iou = iou
+                                        best_blob_id = blob_id
                             
-                            # Find local maximum constrained to the same blob
-                            new_z, new_y, new_x, found_in_blob = self._find_local_maximum_in_blob(
-                                smoothed, 
-                                labeled_blobs,
-                                cz, cy, cx,
-                                SEARCH_RADIUS,
-                                current_blob_id
-                            )
-                            
-                            # Calculate shift vector
-                            new_centroid = np.array([new_z, new_y, new_x])
-                            shift_vector = new_centroid - centroid_prev
-                            shift_distance = np.linalg.norm(shift_vector)
-                            
-                            # Only propagate if shift is reasonable (relax found_in_blob requirement)
-                            if shift_distance > MAX_SHIFT_DISTANCE:
-                                print(f"    Skipping object {obj_id} at t={t}: shift too large ({shift_distance:.1f} > {MAX_SHIFT_DISTANCE})")
-                                continue
-                            
-                            # Translate the mask
-                            shifted_mask = shift(mask_prev.astype(float), shift_vector, order=0, mode='constant', cval=0)
-                            shifted_mask = (shifted_mask > 0.5)
-                            
-                            # Add to new segmentation (first-come-first-served)
-                            new_seg[shifted_mask & (new_seg == 0)] = obj_id
-                            objects_propagated += 1
-                            total_propagated += 1
+                            # Propagate with best match found (fallback to low IOU if necessary)
+                            if best_blob_id is not None:
+                                # Use the matched blob as the new mask
+                                new_mask = (labeled_blobs == best_blob_id)
+                                new_seg[new_mask & (new_seg == 0)] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                                
+                                # Warn if IOU is below normal threshold
+                                if best_iou < MIN_IOU_THRESHOLD:
+                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
+                            else:
+                                # No overlapping blobs found at all - truly skip
+                                print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
                         
                         # Update segmentation_4d
                         if new_seg.max() > 0:
                             self.segmentation_4d[t] = new_seg
-                            print(f"  t={t}: {objects_propagated}/{len(prev_ids)} objects")
                     
                     # Refresh viewer
                     if "committed_objects_4d" in self._viewer.layers:
@@ -1814,7 +1789,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                         f"✓ Propagated segmentation\n\n"
                         f"Source timestep: {current_t}\n"
                         f"Objects tracked: {len(current_ids)}\n"
-                        f"Objects tracked across timesteps using centroid matching"
+                        f"Method: IoU-based matching (threshold: {MIN_IOU_THRESHOLD})"
                     )
                     
                 except Exception as e:
@@ -1824,6 +1799,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                     show_info(f"❌ Error: {str(e)}")
 
             btn_propagate.clicked.connect(_propagate_segmentation)
+            
+            # Store reference for keybind access
+            self._propagate_segmentation_func = _propagate_segmentation
+            
             point_layout.addWidget(propagate_row)
 
             # ========== LOAD NEUROPAL PROMPTS ==========
@@ -2199,7 +2178,46 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             # don't fail initialization if Qt isn't available
             pass
-
+    
+    def _create_keybindings(self):
+        """Override base class keybindings with 4D-specific shortcuts.
+        
+        4D annotator keybindings:
+        - Shift+S: Segment all objects across timesteps
+        - Shift+P: Segment + Propagate current segmentation across time
+        - C: Commit all timesteps
+        """
+        @self._viewer.bind_key("Shift-S", overwrite=True)
+        def _segment_all_timesteps(viewer):
+            try:
+                self.segment_all_timesteps()
+            except Exception as e:
+                print(f"Error in segment_all_timesteps: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        @self._viewer.bind_key("Shift-P", overwrite=True)
+        def _segment_and_propagate(viewer):
+            try:
+                # Call the segmentation propagation function (IOU-based mask propagation)
+                if hasattr(self, '_propagate_segmentation_func'):
+                    self._propagate_segmentation_func()
+                else:
+                    # Fallback to old behavior if function not yet initialized
+                    self.segment_and_propagate_all_timesteps()
+            except Exception as e:
+                print(f"Error in propagate segmentation: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        @self._viewer.bind_key("c", overwrite=True)
+        def _commit_all_timesteps(viewer):
+            try:
+                self.commit_all_timesteps()
+            except Exception as e:
+                print(f"Error in commit_all_timesteps: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _reorder_layers(self):
         """Reorder layers according to desired order and persist across timestep changes."""
@@ -2261,16 +2279,48 @@ class MicroSAM4DAnnotator(Annotator3d):
             self._viewer.dims.axis_labels = ["T", "Z", "Y", "X"]
         except Exception:
             pass
+        
+        # Calculate contrast limits for better visualization of calcium imaging data
+        # Use percentile-based limits to handle sparse/dim data like calcium imaging
+        try:
+            image_float = image_4d.astype(float)
+            nonzero = image_float[image_float > 0]
+            if len(nonzero) > 0:
+                vmin = 0.0
+                vmax = float(np.percentile(nonzero, 99.5))  # Focus on bright features
+            else:
+                vmin = float(image_float.min())
+                vmax = float(image_float.max())
+            if vmin >= vmax:
+                vmax = vmin + 1.0
+            contrast_limits = [vmin, vmax]
+        except Exception:
+            contrast_limits = None
+        
         # add or update persistent 4D raw image layer
         if "raw_4d" in self._viewer.layers:
             try:
-                self._viewer.layers["raw_4d"].data = image_4d
+                self._viewer.layers["raw_4d"].data = image_4d.astype(float)
                 self._viewer.layers["raw_4d"].visible = True
+                # Update contrast limits for existing layer
+                if contrast_limits is not None:
+                    self._viewer.layers["raw_4d"].contrast_limits = contrast_limits
             except Exception:
                 pass
         else:
             try:
-                self._viewer.add_image(image_4d, name="raw_4d")
+                layer = self._viewer.add_image(
+                    image_4d.astype(float), 
+                    name="raw_4d",
+                    contrast_limits=contrast_limits,
+                    gamma=0.8,  # Brighten dim features (important for calcium imaging)
+                )
+                # Set smooth interpolation for cleaner visualization
+                try:
+                    layer.interpolation2d = "linear"
+                    layer.interpolation3d = "linear"
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3456,10 +3506,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                         except Exception:
                             pass
                         try:
-                            show_info(f"Embeddings t{t} active • size={orig if orig is not None else 'unknown'} • tiled={bool(tiled)} • source={src_name}")
-                        except Exception:
-                            pass
-                        try:
                             self._reported_embedding_info_t.add(int(t))
                         except Exception:
                             pass
@@ -4214,21 +4260,15 @@ class MicroSAM4DAnnotator(Annotator3d):
         print(f"🔄 Found {len(prompt_timesteps)} timesteps with prompts: {prompt_timesteps}")
         
         # CRITICAL: Compute embeddings for ALL timesteps before propagation
-        print(f"\n🔧 Ensuring embeddings are computed for all {self.n_timesteps} timesteps...")
         if hasattr(self, 'timestep_embedding_manager') and self.timestep_embedding_manager is not None:
             for t in range(self.n_timesteps):
                 try:
                     # Check if embeddings already exist
                     entry = self.embeddings_4d.get(int(t)) if hasattr(self, "embeddings_4d") else None
                     if entry is None:
-                        print(f"  Computing embeddings for t={t}...")
                         self.timestep_embedding_manager.on_timestep_changed(int(t))
-                    else:
-                        print(f"  ✓ Embeddings already exist for t={t}")
-                except Exception as e:
-                    print(f"  ⚠ Failed to compute embeddings for t={t}: {e}")
-        else:
-            print(f"  ⚠ No timestep_embedding_manager available")
+                except Exception:
+                    pass
         
         print(f"\n")
         
@@ -4723,6 +4763,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     
                     # Use segment_mask_in_volume to propagate across time dimension
                     # The "segmented_slices" parameter is the anchor timestep(s)
+                    # Use box projection + lower IOU threshold to handle spatial shifts (worm movement)
                     print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
                     tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
                         segmentation=tyx_seg,
@@ -4731,12 +4772,36 @@ class MicroSAM4DAnnotator(Annotator3d):
                         segmented_slices=np.array(anchor_timesteps),
                         stop_lower=False,  # Propagate backward in time
                         stop_upper=False,  # Propagate forward in time
-                        iou_threshold=0.5,
-                        projection="mask",  # Use mask projection
-                        verbose=False,
+                        iou_threshold=0.3,  # Lower threshold to handle spatial shifts
+                        projection="box",  # Box projection allows spatial movement
+                        verbose=True,  # Show where propagation stops
                     )
                     
                     print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                    
+                    # Check coverage and retry with even lower threshold if needed
+                    expected_range = min(t_end, self.n_timesteps) - t_start
+                    actual_range = t_max - t_min + 1
+                    coverage = actual_range / expected_range if expected_range > 0 else 0
+                    
+                    if coverage < 0.8:  # Less than 80% coverage
+                        print(f"      Z={z}: Low coverage ({coverage:.1%}). Retrying with IOU=0.2...")
+                        tyx_seg_retry = tyx_seg.copy()
+                        try:
+                            tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                                segmentation=tyx_seg_retry,
+                                predictor=state.predictor,
+                                image_embeddings=tyx_embeddings,
+                                segmented_slices=np.array(anchor_timesteps),
+                                stop_lower=False,
+                                stop_upper=False,
+                                iou_threshold=0.2,  # Very forgiving for large movements
+                                projection="box",
+                                verbose=True,
+                            )
+                            print(f"      Z={z}: Retry succeeded - propagated from t={t_min} to t={t_max}")
+                        except Exception as e:
+                            print(f"      Z={z}: Retry failed - {e}")
                     
                     # Write back to 4D volume: current_object_4d[:, z, :, :]
                     # Only write for timesteps between t_start and t_end
@@ -4870,6 +4935,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                             anchor_timesteps.append(t_check)
                     
                     # Use segment_mask_in_volume
+                    # Use box projection + lower IOU threshold to handle spatial shifts (worm movement)
                     print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
                     tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
                         segmentation=tyx_seg,
@@ -4878,12 +4944,36 @@ class MicroSAM4DAnnotator(Annotator3d):
                         segmented_slices=np.array(anchor_timesteps),
                         stop_lower=False,
                         stop_upper=True,  # Don't propagate forward (already done)
-                        iou_threshold=0.5,
-                        projection="mask",
-                        verbose=False,
+                        iou_threshold=0.3,  # Lower threshold to handle spatial shifts
+                        projection="box",  # Box projection allows spatial movement
+                        verbose=True,  # Show where propagation stops
                     )
                     
                     print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                    
+                    # Check coverage and retry with even lower threshold if needed
+                    expected_range = t_start - t_end
+                    actual_range = t_max - t_min + 1
+                    coverage = actual_range / expected_range if expected_range > 0 else 0
+                    
+                    if coverage < 0.8:  # Less than 80% coverage
+                        print(f"      Z={z}: Low coverage ({coverage:.1%}). Retrying with IOU=0.2...")
+                        tyx_seg_retry = tyx_seg.copy()
+                        try:
+                            tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                                segmentation=tyx_seg_retry,
+                                predictor=state.predictor,
+                                image_embeddings=tyx_embeddings,
+                                segmented_slices=np.array(anchor_timesteps),
+                                stop_lower=False,
+                                stop_upper=True,
+                                iou_threshold=0.2,  # Very forgiving for large movements
+                                projection="box",
+                                verbose=True,
+                            )
+                            print(f"      Z={z}: Retry succeeded - propagated from t={t_min} to t={t_max}")
+                        except Exception as e:
+                            print(f"      Z={z}: Retry failed - {e}")
                     
                     # Write back to 4D volume for timesteps between t_end and t_start
                     for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
@@ -4989,6 +5079,10 @@ class MicroSAM4DAnnotator(Annotator3d):
             if pts_arr.size == 0:
                 continue
 
+            # CRITICAL: Save current points to prompt_map so debug_segmentation_4d can see them
+            # This ensures newly placed points are recognized before debug checks
+            self.point_prompts_4d[t] = pts_arr
+            
             # DON'T update self.current_timestep to avoid triggering callbacks
             # Just work with 't' directly for embedding activation
 
@@ -5139,110 +5233,112 @@ class MicroSAM4DAnnotator(Annotator3d):
                     # Get box prompts layer (usually empty for point-based workflow)
                     box_layer = self._viewer.layers["prompts"] if "prompts" in self._viewer.layers else None
                     
-                    # Process each ID group separately using OLD conservative logic
-                    prompt_count = 0
-                    for target_id, points_list in points_by_id.items():
-                        prompt_count += 1
-                        print(f"Segmenting prompt {prompt_count}", end="", flush=True)
+                # Process each ID group separately - NEW APPROACH: Segment ALL slices with points
+                prompt_count = 0
+                for target_id, points_list in points_by_id.items():
+                    prompt_count += 1
+                    print(f"Segmenting prompt {prompt_count}", end="", flush=True)
+                    
+                    # Extract just the coordinates for this ID
+                    id_points = np.array([point for _, point in points_list])
+                    
+                    # Collect negative prompts from all OTHER IDs to prevent overlap
+                    # Only if the checkbox is enabled
+                    negative_points = []
+                    use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
+                    if use_negative is not None and use_negative.isChecked():
+                        for other_id, other_points_list in points_by_id.items():
+                            if other_id != target_id:
+                                for _, other_point in other_points_list:
+                                    negative_points.append(other_point)
+                    
+                    # NEW APPROACH: Segment ALL slices that have points (not just the first one)
+                    # Group points by Z-slice
+                    points_by_z = {}
+                    for point in id_points:
+                        z = int(point[0])
+                        if z not in points_by_z:
+                            points_by_z[z] = []
+                        points_by_z[z].append(point[1:])  # Store (Y, X) only
+                    
+                    # Also group negative points by Z-slice
+                    negative_by_z = {}
+                    if len(negative_points) > 0:
+                        for neg_point in negative_points:
+                            z = int(neg_point[0])
+                            if z not in negative_by_z:
+                                negative_by_z[z] = []
+                            negative_by_z[z].append(neg_point[1:])  # Store (Y, X) only
+                    
+                    # Segment each Z-slice that has points for this ID
+                    seg_id = np.zeros(shape, dtype=np.uint32)
+                    segmented_slices = []
+                    
+                    for z, pos_points in points_by_z.items():
+                        # Combine positive and negative points for this slice
+                        slice_points = pos_points.copy()
+                        slice_labels = [1] * len(pos_points)  # positive labels
                         
-                        # Extract just the coordinates for this ID
-                        id_points = np.array([point for _, point in points_list])
+                        # Add negative points from other IDs on this slice
+                        if z in negative_by_z:
+                            slice_points.extend(negative_by_z[z])
+                            slice_labels.extend([0] * len(negative_by_z[z]))  # negative labels
                         
-                        # Collect negative prompts from all OTHER IDs to prevent overlap
-                        # Only if the checkbox is enabled
-                        negative_points = []
-                        use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
-                        if use_negative is not None and use_negative.isChecked():
-                            for other_id, other_points_list in points_by_id.items():
-                                if other_id != target_id:
-                                    for _, other_point in other_points_list:
-                                        negative_points.append(other_point)
+                        slice_points = np.array(slice_points)
+                        slice_labels = np.array(slice_labels)
                         
-                        # OLD CONSERVATIVE APPROACH:
-                        # 1. Segment only the FIRST slice with a point (not all slices)
-                        # 2. Use higher IOU threshold (0.65 instead of 0.5)
-                        # 3. This prevents jumping to nearby neurons
-                        
-                        # Get the first Z-slice that has a point for this ID
-                        first_z = int(id_points[0, 0])  # Z coordinate of first point
-                        
-                        # Prepare points and labels for the first slice only
-                        first_slice_points = []
-                        first_slice_labels = []
-                        
-                        # Add positive points from this ID on the first slice
-                        for point in id_points:
-                            if int(point[0]) == first_z:
-                                first_slice_points.append(point[1:])  # (Y, X) only
-                                first_slice_labels.append(1)  # positive
-                        
-                        # Add negative points from other IDs on the first slice
-                        if len(negative_points) > 0:
-                            for neg_point in negative_points:
-                                if int(neg_point[0]) == first_z:
-                                    first_slice_points.append(neg_point[1:])  # (Y, X) only
-                                    first_slice_labels.append(0)  # negative
-                        
-                        if len(first_slice_points) == 0:
-                            print(f"... Skipped (no points on first slice)")
-                            continue
-                        
-                        first_slice_points = np.array(first_slice_points)
-                        first_slice_labels = np.array(first_slice_labels)
-                        
-                        # Segment the first slice using prompt_segmentation
-                        seg_id = np.zeros(shape, dtype=np.uint32)
+                        # Segment this slice
                         try:
                             mask_2d = sam_util.prompt_segmentation(
                                 state.predictor,
-                                first_slice_points,
-                                first_slice_labels,
+                                slice_points,
+                                slice_labels,
                                 boxes=np.array([]),
                                 masks=None,
                                 shape=shape[1:],  # (Y, X) for 2D slice
                                 multiple_box_prompts=False,
-                                i=first_z,
+                                i=z,
                                 image_embeddings=state.image_embeddings,
                             )
                             if mask_2d is not None and mask_2d.max() > 0:
-                                seg_id[first_z] = mask_2d
+                                seg_id[z] = mask_2d
+                                segmented_slices.append(z)
                         except Exception:
-                            print(f"... Skipped (segmentation failed)")
-                            continue
-                        
-                        # Extend through the volume with higher IOU threshold (0.65)
-                        if seg_id.max() > 0:
-                            try:
-                                seg_id, (z_min, z_max) = segment_mask_in_volume(
-                                    seg_id,
-                                    state.predictor,
-                                    state.image_embeddings,
-                                    np.array([first_z]),  # Only one slice segmented
-                                    stop_lower=False,
-                                    stop_upper=False,
-                                    iou_threshold=0.65,  # Higher threshold = more conservative
-                                    projection="single_point",
-                                    box_extension=0.05,
-                                    update_progress=None,
-                                )
-                            except Exception:
-                                pass
-                        
-                        # Add ID-specific segmentation to merged result with target ID
-                        # Only assign pixels that haven't been claimed by previous objects
-                        if seg_id.max() > 0:
-                            mask = seg_id > 0
-                            # Only write to unclaimed pixels (background = 0)
-                            unclaimed_mask = (seg_merged == 0) & mask
-                            seg_merged[unclaimed_mask] = target_id
-                            print(f"... Done")
-                        else:
-                            print(f"... Skipped")
+                            pass
                     
-                    seg = seg_merged if seg_merged.max() > 0 else None
-                      
-                    if seg is None:
-                        continue
+                    # Extend through the volume using all segmented slices as anchors
+                    if len(segmented_slices) > 0:
+                        try:
+                            seg_id, (z_min, z_max) = segment_mask_in_volume(
+                                seg_id,
+                                state.predictor,
+                                state.image_embeddings,
+                                np.array(segmented_slices),  # Use ALL segmented slices
+                                stop_lower=False,
+                                stop_upper=False,
+                                iou_threshold=0.65,  # Higher threshold = more conservative
+                                projection="single_point",
+                                box_extension=0.05,
+                                update_progress=None,
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Add ID-specific segmentation to merged result with target ID
+                    # Only assign pixels that haven't been claimed by previous objects
+                    if seg_id.max() > 0:
+                        mask = seg_id > 0
+                        # Only write to unclaimed pixels (background = 0)
+                        unclaimed_mask = (seg_merged == 0) & mask
+                        seg_merged[unclaimed_mask] = target_id
+                        print(f"... Done")
+                    else:
+                        print(f"... Skipped")
+                
+                seg = seg_merged if seg_merged.max() > 0 else None
+                  
+                if seg is None:
+                    continue
                     
                 if seg is not None:
                     # Store directly into current_object_4d and update the layer
@@ -5461,8 +5557,10 @@ class MicroSAM4DAnnotator(Annotator3d):
         # Get point IDs for current timestep
         current_ids = self._get_point_ids_for_timestep(current_t, current_points)
         
-        # Search radius for local maxima (in pixels)
-        SEARCH_RADIUS = 7
+        # Base search radius for local maxima (in pixels)
+        BASE_SEARCH_RADIUS = 7
+        LARGE_SEARCH_RADIUS = 15  # Used when large displacement detected
+        DISPLACEMENT_THRESHOLD = 10  # Pixels - above this triggers large search
         
         # Intensity threshold percentile (below this is considered background)
         BACKGROUND_THRESHOLD_PERCENTILE = 50
@@ -5471,14 +5569,22 @@ class MicroSAM4DAnnotator(Annotator3d):
         
         # Forward propagation (current_t -> end)
         for t in range(current_t + 1, int(self.n_timesteps)):
+            # Calculate adaptive search radius based on previous displacement
+            search_radius = self._calculate_adaptive_search_radius(
+                t - 1, t - 2, BASE_SEARCH_RADIUS, LARGE_SEARCH_RADIUS, DISPLACEMENT_THRESHOLD
+            )
             self._propagate_points_to_timestep(
-                t, t - 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+                t, t - 1, search_radius, BACKGROUND_THRESHOLD_PERCENTILE
             )
         
         # Backward propagation (current_t -> start)
         for t in range(current_t - 1, -1, -1):
+            # Calculate adaptive search radius based on previous displacement
+            search_radius = self._calculate_adaptive_search_radius(
+                t + 1, t + 2, BASE_SEARCH_RADIUS, LARGE_SEARCH_RADIUS, DISPLACEMENT_THRESHOLD
+            )
             self._propagate_points_to_timestep(
-                t, t + 1, SEARCH_RADIUS, BACKGROUND_THRESHOLD_PERCENTILE
+                t, t + 1, search_radius, BACKGROUND_THRESHOLD_PERCENTILE
             )
         
         # Update viewer to show propagated points
@@ -5486,6 +5592,62 @@ class MicroSAM4DAnnotator(Annotator3d):
         
         total_points = sum(len(pts) for pts in self.point_prompts_4d.values())
         show_info(f"✅ Propagated points to all timesteps! Total points: {total_points}")
+    
+    def _calculate_adaptive_search_radius(self, current_t, prev_t, base_radius, large_radius, displacement_threshold):
+        """Calculate adaptive search radius based on recent displacement between timesteps.
+        
+        Args:
+            current_t: Current timestep
+            prev_t: Previous timestep to compare against
+            base_radius: Normal search radius for small movements
+            large_radius: Expanded search radius for large movements
+            displacement_threshold: Displacement above which to use large_radius
+            
+        Returns:
+            Adaptive search radius (int)
+        """
+        # If we don't have points for both timesteps, use base radius
+        if not hasattr(self, 'point_prompts_4d'):
+            return base_radius
+            
+        current_points = self.point_prompts_4d.get(current_t)
+        prev_points = self.point_prompts_4d.get(prev_t)
+        
+        # Need both timesteps to calculate displacement
+        if current_points is None or prev_points is None or len(current_points) == 0 or len(prev_points) == 0:
+            return base_radius
+        
+        # Calculate mean displacement between matched points
+        # Use point IDs to match corresponding neurons
+        current_ids = self._get_point_ids_for_timestep(current_t, current_points)
+        prev_ids = self._get_point_ids_for_timestep(prev_t, prev_points)
+        
+        # Build ID -> position mappings
+        current_id_map = {current_ids[i]: current_points[i] for i in range(len(current_points))}
+        prev_id_map = {prev_ids[i]: prev_points[i] for i in range(len(prev_points))}
+        
+        # Calculate displacements for matched IDs
+        displacements = []
+        for point_id in current_id_map:
+            if point_id in prev_id_map:
+                curr_pos = current_id_map[point_id]
+                prev_pos = prev_id_map[point_id]
+                displacement = np.sqrt(np.sum((curr_pos - prev_pos)**2))
+                displacements.append(displacement)
+        
+        if len(displacements) == 0:
+            return base_radius
+        
+        # Use max displacement to be conservative (handle worst case)
+        max_displacement = np.max(displacements)
+        mean_displacement = np.mean(displacements)
+        
+        # If recent movement was large, use expanded search radius
+        if max_displacement > displacement_threshold:
+            print(f"  ⚠ Large displacement detected ({max_displacement:.1f}px) - using expanded search radius {large_radius}px")
+            return large_radius
+        else:
+            return base_radius
     
     def _propagate_points_to_timestep(self, target_t, source_t, search_radius, threshold_percentile):
         """Propagate points from source_t to target_t using Hungarian algorithm for optimal matching."""

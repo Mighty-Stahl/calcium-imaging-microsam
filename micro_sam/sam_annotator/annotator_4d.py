@@ -953,8 +953,10 @@ class MicroSAM4DAnnotator(Annotator3d):
             save_load_layout = QtWidgets.QHBoxLayout()
             save_load_row.setLayout(save_load_layout)
             btn_save = QtWidgets.QPushButton("Save embeddings")
+            btn_save_current = QtWidgets.QPushButton("Save embeddings (current T)")
             btn_load = QtWidgets.QPushButton("Load embeddings from directory")
             save_load_layout.addWidget(btn_save)
+            save_load_layout.addWidget(btn_save_current)
             save_load_layout.addWidget(btn_load)
             emb_layout.addWidget(save_load_row)
 
@@ -990,6 +992,39 @@ class MicroSAM4DAnnotator(Annotator3d):
                 except Exception as e:
                     print(f"Failed to save embeddings: {e}")
                     show_info(f"Failed to save embeddings: {e}")
+
+            def _save_embeddings_current():
+                try:
+                    # Get current timestep
+                    t = int(getattr(self, "current_timestep", 0) or 0)
+                    
+                    # Select directory to save embeddings
+                    directory = QFileDialog.getExistingDirectory(
+                        None, 
+                        f"Select Directory to Save Embedding for Timestep {t}",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    save_path = Path(directory)
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    
+                    filename = save_path / f"t{t}.zarr"
+                    show_info(f"Computing and saving embedding for timestep {t}...")
+                    
+                    self.compute_embeddings_for_timestep(
+                        t=t, 
+                        save_path=str(filename)
+                    )
+                    
+                    # Store the directory path for future reference
+                    self._last_embeddings_dir = str(save_path)
+                    show_info(f"Embedding for timestep {t} saved to {filename}")
+                    
+                except Exception as e:
+                    print(f"Failed to save embedding for current timestep: {e}")
+                    show_info(f"Failed to save embedding: {e}")
 
             def _load_embeddings():
                 try:
@@ -1038,6 +1073,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     show_info(f"Failed to load embeddings: {e}")
 
             btn_save.clicked.connect(_save_embeddings)
+            btn_save_current.clicked.connect(_save_embeddings_current)
             btn_load.clicked.connect(_load_embeddings)
 
             # Removed save/load embeddings folder functions and handlers
@@ -1627,6 +1663,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                         return
                     
                     from scipy.ndimage import center_of_mass, shift, maximum_filter
+                    from scipy.ndimage import label, binary_dilation
                     
                     current_t = int(self.current_timestep)
                     seg_current = self.segmentation_4d[current_t]
@@ -1645,7 +1682,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     
                     # Search radius for local maximum detection
                     SEARCH_RADIUS = 10
-                    MAX_SHIFT_DISTANCE = 50  # Maximum allowed shift between timesteps
+                    MAX_SHIFT_DISTANCE = 40  # Maximum allowed shift between timesteps
                     
                     total_propagated = 0
                     
@@ -1696,8 +1733,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                             
                             # Propagate with best match found (fallback to low IOU if necessary)
                             if best_blob_id is not None:
-                                # Use the matched blob as the new mask
+                                # Use the matched blob and expand it to include dim edges
                                 new_mask = (labeled_blobs == best_blob_id)
+                                # Dilate by 2 pixels to capture edges that fall below threshold
+                                new_mask = binary_dilation(new_mask, iterations=1)
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
@@ -1706,8 +1745,13 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 if best_iou < MIN_IOU_THRESHOLD:
                                     print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
                             else:
-                                # No overlapping blobs found at all - truly skip
-                                print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
+                                # No overlapping blobs found - use fallback from previous timestep
+                                # Copy the mask from t-1 to maintain continuity
+                                new_seg[mask_prev] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                                pixels_count = np.count_nonzero(mask_prev)
+                                print(f"    ⚠ Object {obj_id} at t={t}: No blobs found, copied {pixels_count} pixels from t={t-1} (fallback)")
                         
                         # Update segmentation_4d
                         if new_seg.max() > 0:
@@ -1757,10 +1801,12 @@ class MicroSAM4DAnnotator(Annotator3d):
                                         best_iou = iou
                                         best_blob_id = blob_id
                             
-                            # Propagate with best match found (fallback to low IOU if necessary)
+                            # Propagate with best match found (backward direction)
                             if best_blob_id is not None:
-                                # Use the matched blob as the new mask
+                                # Use the matched blob and expand it to include dim edges
                                 new_mask = (labeled_blobs == best_blob_id)
+                                # Dilate by 2 pixels to capture edges that fall below threshold
+                                new_mask = binary_dilation(new_mask, iterations=2)
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
@@ -1769,8 +1815,13 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 if best_iou < MIN_IOU_THRESHOLD:
                                     print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
                             else:
-                                # No overlapping blobs found at all - truly skip
-                                print(f"    Skipping object {obj_id} at t={t}: no overlapping blobs found")
+                                # No overlapping blobs found - use fallback from next timestep (going backward)
+                                # Copy the mask from t+1 to maintain continuity
+                                new_seg[mask_prev] = obj_id
+                                objects_propagated += 1
+                                total_propagated += 1
+                                pixels_count = np.count_nonzero(mask_prev)
+                                print(f"    ⚠ Object {obj_id} at t={t}: No blobs found, copied {pixels_count} pixels from t={t+1} (fallback)")
                         
                         # Update segmentation_4d
                         if new_seg.max() > 0:
@@ -3819,256 +3870,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             results.append(seg)
         return results
 
-    def remap_segment_id(self, timestep: int, old_id: int, new_id: int, propagate_forward: bool = False):
-        """Remap a segment ID in a specific timestep.
-
-        Args:
-            timestep: The timestep containing the segment to remap
-            old_id: The current ID of the segment
-            new_id: The new ID to assign
-            propagate_forward: If True, propagate the remapping to future timesteps
-        """
-        if self.segmentation_4d is None:
-            raise ValueError("No segmentation available")
-        if not (0 <= timestep < self.n_timesteps):
-            raise ValueError(f"Invalid timestep {timestep}")
-
-        # Do the remapping for the specified timestep
-        mask = self.segmentation_4d[timestep] == old_id
-        if not np.any(mask):
-            print(f"⚠️ No object with ID {old_id} found in timestep {timestep}")
-            return
-
-        self.segmentation_4d[timestep][mask] = new_id
-
-        # Update the view
-        try:
-            layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
-            if layer is not None:
-                layer.data = self.segmentation_4d
-                try:
-                    layer.refresh()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Propagate to future timesteps if requested
-        if propagate_forward:
-            for t in range(timestep + 1, self.n_timesteps):
-                mask = self.segmentation_4d[t] == old_id
-                if np.any(mask):
-                    self.segmentation_4d[t][mask] = new_id
-
-        print(f"✅ Remapped segment ID {old_id} to {new_id} in timestep {timestep}"
-              f"{' and propagated forward' if propagate_forward else ''}")
-
-        # Update cache if it exists
-        if self._segmentation_cache is not None:
-            try:
-                if 0 <= timestep < len(self._segmentation_cache):
-                    self._segmentation_cache[timestep] = self.segmentation_4d[timestep].copy()
-                    if propagate_forward:
-                        for t in range(timestep + 1, min(self.n_timesteps, len(self._segmentation_cache))):
-                            self._segmentation_cache[t] = self.segmentation_4d[t].copy()
-            except Exception:
-                pass
-
-    # ----------------- Remap points helpers -----------------
-    def _on_remap_points_changed(self):
-        """Called whenever `remap_points` layer data changes.
-
-        Adds/removes UI entries and records the original segment ID under each point
-        for the current timestep.
-        """
-        try:
-            lay = getattr(self, "_remap_points_layer", None)
-            if lay is None:
-                return
-            pts = np.array(getattr(lay, "data", []))
-            if pts is None:
-                pts = np.empty((0, 3))
-
-            n = len(pts)
-            prev = len(getattr(self, "_remap_point_original_ids", []))
-
-            # remove trailing widgets if points were deleted
-            if n < prev:
-                try:
-                    while len(self._remap_target_widgets) > n:
-                        w = self._remap_target_widgets.pop()
-                        widget = w.get("widget")
-                        try:
-                            self._remap_entries_container.removeWidget(widget)
-                        except Exception:
-                            pass
-                        try:
-                            widget.setParent(None)
-                        except Exception:
-                            pass
-                        self._remap_point_original_ids.pop()
-                except Exception:
-                    pass
-
-            # For each point, compute original segment id and create UI entry if new
-            for i in range(n):
-                try:
-                    coord = pts[i]
-                    z = int(round(float(coord[0])))
-                    y = int(round(float(coord[1])))
-                    x = int(round(float(coord[2])))
-                    orig = 0
-                    try:
-                        if self.segmentation_4d is not None and 0 <= self.current_timestep < self.n_timesteps:
-                            vol = self.segmentation_4d[int(self.current_timestep)]
-                            # bounds check
-                            if 0 <= z < vol.shape[0] and 0 <= y < vol.shape[1] and 0 <= x < vol.shape[2]:
-                                orig = int(vol[z, y, x])
-                    except Exception:
-                        orig = 0
-
-                    if i < prev:
-                        # update stored original id and refresh label text
-                        try:
-                            self._remap_point_original_ids[i] = orig
-                            self._remap_target_widgets[i]["label"].setText(f"Point #{i+1} (orig {orig}) → target ID:")
-                        except Exception:
-                            pass
-                    else:
-                        # create new UI entry for this point
-                        try:
-                            self._add_remap_entry(i, orig)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _add_remap_entry(self, index: int, original_id: int):
-        """Create a labeled entry (label + SpinBox) for a remap point and add it to the UI container."""
-        try:
-            container = QtWidgets.QWidget()
-            container.setLayout(QtWidgets.QHBoxLayout())
-            container.layout().setContentsMargins(0, 0, 0, 0)
-            label = QtWidgets.QLabel(f"Point #{index+1} (orig {original_id}) → target ID:")
-            spin = QtWidgets.QSpinBox()
-            spin.setRange(0, 2_000_000_000)
-            spin.setValue(0)
-            container.layout().addWidget(label)
-            container.layout().addWidget(spin)
-
-            try:
-                self._remap_entries_container.addWidget(container)
-            except Exception:
-                try:
-                    # If container is a QVBoxLayout instance
-                    self._remap_entries_container.addWidget(container)
-                except Exception:
-                    pass
-
-            # store references aligned with points order
-            try:
-                self._remap_point_original_ids.append(int(original_id))
-            except Exception:
-                self._remap_point_original_ids.append(0)
-            self._remap_target_widgets.append({"widget": container, "label": label, "spin": spin})
-        except Exception:
-            pass
-
-    def apply_remaps(self):
-        """Apply all remapping rules defined by remap points and their target widgets.
-
-        Replaces every voxel of each point's original segment ID with the specified
-        target ID in the current timestep's segmentation layer.
-        """
-        try:
-            t = int(getattr(self, "current_timestep", 0) or 0)
-            if self.segmentation_4d is None:
-                show_info("No segmentation loaded; cannot apply remaps.")
-                return
-
-            # iterate over entries
-            for i, entry in enumerate(self._remap_target_widgets):
-                try:
-                    orig = int(self._remap_point_original_ids[i])
-                    target = int(entry["spin"].value())
-                    if orig == 0:
-                        # skip background/no-op
-                        continue
-                    if target == orig:
-                        continue
-                    # call existing remapping helper (will update layer and cache)
-                    try:
-                        self.remap_segment_id(timestep=t, old_id=orig, new_id=target, propagate_forward=False)
-                    except Exception:
-                        # fallback: manual replace
-                        try:
-                            mask = self.segmentation_4d[t] == orig
-                            if np.any(mask):
-                                self.segmentation_4d[t][mask] = target
-                                layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
-                                if layer is not None:
-                                    layer.data = self.segmentation_4d
-                                    try:
-                                        layer.refresh()
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            try:
-                show_info("Remapping applied for current timestep.")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"Failed to apply remaps: {e}")
-
-    def clear_remap_points(self):
-        """Clear all points in the `remap_points` layer and remove corresponding UI entries."""
-        try:
-            # clear napari points layer
-            lay = getattr(self, "_remap_points_layer", None)
-            if lay is not None:
-                try:
-                    lay.data = np.empty((0, 3))
-                except Exception:
-                    try:
-                        # fallback to .data assignment as list
-                        lay.data = []
-                    except Exception:
-                        pass
-
-            # remove UI widgets
-            try:
-                while getattr(self, "_remap_target_widgets", None) and len(self._remap_target_widgets) > 0:
-                    w = self._remap_target_widgets.pop()
-                    widget = w.get("widget")
-                    try:
-                        self._remap_entries_container.removeWidget(widget)
-                    except Exception:
-                        pass
-                    try:
-                        widget.setParent(None)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # clear stored ids
-            try:
-                self._remap_point_original_ids = []
-            except Exception:
-                pass
-
-            try:
-                show_info("Cleared remap points and UI entries.")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"Failed to clear remap points: {e}")
+    
 
     def debug_segmentation_4d(self, t: int) -> bool:
         """Debug segmentation setup for a specific timestep.
@@ -4774,6 +4576,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                     # Write back to 4D volume: current_object_4d[:, z, :, :]
                     # Only write for timesteps between t_start and t_end
                     print(f"      Z={z}: Writing back results for timesteps {max(t_start, t_min)} to {min(t_end, t_max + 1) - 1}")
+                    
+                    # Track last valid mask for fallback
+                    last_valid_mask = None
+                    
                     for t in range(max(t_start, t_min), min(t_end, t_max + 1)):
                         if tyx_seg_result[t].any():
                             # Only write where we have new segmentation
@@ -4782,8 +4588,17 @@ class MicroSAM4DAnnotator(Annotator3d):
                             # Preserve this object's segmentation
                             self.current_object_4d[t][z][mask_t] = obj_id
                             print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
+                            # Store this as last valid mask
+                            last_valid_mask = mask_t.copy()
                         else:
-                            print(f"      Z={z}: No pixels for t={t}")
+                            # No segmentation at this timestep - use fallback from previous timestep
+                            if last_valid_mask is not None:
+                                # Copy the previous timestep's mask
+                                self.current_object_4d[t][z][last_valid_mask] = obj_id
+                                pixels_count = np.count_nonzero(last_valid_mask)
+                                print(f"      Z={z}: No mask at t={t}, copied {pixels_count} pixels from t={t-1} (fallback)")
+                            else:
+                                print(f"      Z={z}: No pixels for t={t} (no fallback available)")
                     
                     print(f"      Z={z}: Complete")
                     processed_z_slices.add(z)
@@ -4944,10 +4759,27 @@ class MicroSAM4DAnnotator(Annotator3d):
                             print(f"      Z={z}: Retry failed - {e}")
                     
                     # Write back to 4D volume for timesteps between t_end and t_start
-                    for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
+                    # Track last valid mask for fallback (going backward)
+                    last_valid_mask = None
+                    
+                    # Iterate backward from t_start to t_end
+                    for t in range(min(t_start, t_max), max(t_end - 1, t_min - 1), -1):
                         if tyx_seg_result[t].any():
                             mask_t = tyx_seg_result[t] > 0
                             self.current_object_4d[t][z][mask_t] = obj_id
+                            pixels_count = np.count_nonzero(mask_t)
+                            print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
+                            # Store this as last valid mask
+                            last_valid_mask = mask_t.copy()
+                        else:
+                            # No segmentation at this timestep - use fallback from next timestep (t+1 when going backward)
+                            if last_valid_mask is not None:
+                                # Copy the next timestep's mask (we're going backward)
+                                self.current_object_4d[t][z][last_valid_mask] = obj_id
+                                pixels_count = np.count_nonzero(last_valid_mask)
+                                print(f"      Z={z}: No mask at t={t}, copied {pixels_count} pixels from t={t+1} (fallback)")
+                            else:
+                                print(f"      Z={z}: No pixels for t={t} (no fallback available)")
                     
                     print(f"      Z={z}: Complete")
                     processed_z_slices.add(z)
