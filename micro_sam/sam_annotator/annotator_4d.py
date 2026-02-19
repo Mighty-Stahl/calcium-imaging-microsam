@@ -1688,6 +1688,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                     
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
                     MIN_IOU_THRESHOLD = 0.3  # Minimum IoU to consider a match
+                    MAX_CENTROID_DISTANCE = 25  # Max pixels a neuron can move per timestep
+                    MAX_SIZE_RATIO = 2.5  # Max size change ratio (neuron can't grow/shrink more than 2.5x)
                     
                     for t in range(current_t + 1, self.n_timesteps):
                         seg_prev = self.segmentation_4d[t - 1]
@@ -1707,55 +1709,80 @@ class MicroSAM4DAnnotator(Annotator3d):
                         labeled_blobs, num_blobs = label(foreground_mask)
                         
                         if num_blobs == 0:
+                            # No blobs detected - copy all masks from previous timestep
+                            for obj_id in prev_ids:
+                                mask_prev = (seg_prev == obj_id)
+                                new_seg[mask_prev] = obj_id
+                            self.segmentation_4d[t] = new_seg
                             continue
                         
-                        # IoU-based matching: for each object, find blob with highest overlap
-                        objects_propagated = 0
-                        for obj_id in prev_ids:
+                        # Build cost matrix for Hungarian algorithm with spatial and size constraints
+                        cost_matrix = np.ones((len(prev_ids), num_blobs)) * 1e6  # Large cost = invalid
+                        
+                        for i, obj_id in enumerate(prev_ids):
                             mask_prev = (seg_prev == obj_id)
-                            
-                            # Calculate IoU with each blob in current timestep
-                            best_iou = 0
-                            best_blob_id = None
+                            centroid_prev = center_of_mass(mask_prev)
+                            size_prev = np.count_nonzero(mask_prev)
                             
                             for blob_id in range(1, num_blobs + 1):
                                 blob_mask = (labeled_blobs == blob_id)
+                                centroid_blob = center_of_mass(blob_mask)
+                                size_blob = np.count_nonzero(blob_mask)
                                 
-                                # Calculate intersection and union
+                                # Spatial constraint: check centroid distance
+                                distance = np.sqrt(np.sum((np.array(centroid_prev) - np.array(centroid_blob))**2))
+                                if distance > MAX_CENTROID_DISTANCE:
+                                    continue  # Too far, skip this blob
+                                
+                                # Size constraint: check size ratio
+                                size_ratio = size_blob / size_prev if size_prev > 0 else 1.0
+                                if size_ratio > MAX_SIZE_RATIO or size_ratio < (1.0 / MAX_SIZE_RATIO):
+                                    continue  # Size changed too much, skip this blob
+                                
+                                # Calculate IoU
                                 intersection = np.sum(mask_prev & blob_mask)
                                 union = np.sum(mask_prev | blob_mask)
                                 
                                 if union > 0:
                                     iou = intersection / union
-                                    if iou > best_iou:
-                                        best_iou = iou
-                                        best_blob_id = blob_id
+                                    # Use negative IoU as cost (we minimize cost, want to maximize IoU)
+                                    cost_matrix[i, blob_id - 1] = -iou
+                        
+                        # Use Hungarian algorithm for optimal 1-to-1 assignment
+                        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                        
+                        # Apply assignments
+                        objects_propagated = 0
+                        assigned_neurons = set()
+                        
+                        for i, j in zip(row_ind, col_ind):
+                            obj_id = prev_ids[i]
+                            iou = -cost_matrix[i, j]  # Convert back to positive IoU
                             
-                            # Propagate with best match found (fallback to low IOU if necessary)
-                            if best_blob_id is not None:
-                                # Use the matched blob and expand it to include dim edges
-                                new_mask = (labeled_blobs == best_blob_id)
-                                # Dilate by 2 pixels to capture edges that fall below threshold
-                                new_mask = binary_dilation(new_mask, iterations=1)
+                            # Check if this is a valid assignment
+                            if iou > 0:  # Any positive IoU is considered
+                                blob_id = j + 1
+                                new_mask = (labeled_blobs == blob_id)
+                                # NO dilation to prevent merging with nearby neurons
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
+                                assigned_neurons.add(obj_id)
                                 
-                                # Warn if IOU is below normal threshold
-                                if best_iou < MIN_IOU_THRESHOLD:
-                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
-                            else:
-                                # No overlapping blobs found - use fallback from previous timestep
-                                # Copy the mask from t-1 to maintain continuity
+                                # Warn if IoU is below normal threshold
+                                if iou < MIN_IOU_THRESHOLD:
+                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({iou:.3f} < {MIN_IOU_THRESHOLD}) - using Hungarian match")
+                        
+                        # Handle neurons that weren't assigned (copy from previous timestep)
+                        for obj_id in prev_ids:
+                            if obj_id not in assigned_neurons:
+                                mask_prev = (seg_prev == obj_id)
                                 new_seg[mask_prev] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
-                                pixels_count = np.count_nonzero(mask_prev)
-                                print(f"    ⚠ Object {obj_id} at t={t}: No blobs found, copied {pixels_count} pixels from t={t-1} (fallback)")
                         
-                        # Update segmentation_4d
-                        if new_seg.max() > 0:
-                            self.segmentation_4d[t] = new_seg
+                        # Always write the new segmentation back to the 4D array
+                        self.segmentation_4d[t] = new_seg
                     
                     # Backward propagation: current_t → t-1 → t-2 → ... → 0
                     
@@ -1764,7 +1791,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                         img_curr = self.image_4d[t]
                         new_seg = np.zeros_like(seg_prev, dtype=np.uint32)
                         
-                        # Get object IDs from previous timestep
+                        # Get object IDs from previous timestep (t+1 when going backward)
                         prev_ids = np.unique(seg_prev)
                         prev_ids = prev_ids[prev_ids > 0]
                         
@@ -1777,59 +1804,86 @@ class MicroSAM4DAnnotator(Annotator3d):
                         labeled_blobs, num_blobs = label(foreground_mask)
                         
                         if num_blobs == 0:
+                            # No blobs detected - copy all masks from next timestep
+                            for obj_id in prev_ids:
+                                mask_prev = (seg_prev == obj_id)
+                                new_seg[mask_prev] = obj_id
+                            self.segmentation_4d[t] = new_seg
                             continue
                         
-                        # IoU-based matching: for each object, find blob with highest overlap
-                        objects_propagated = 0
-                        for obj_id in prev_ids:
+                        # Build cost matrix for Hungarian algorithm with spatial and size constraints
+                        cost_matrix = np.ones((len(prev_ids), num_blobs)) * 1e6  # Large cost = invalid
+                        
+                        for i, obj_id in enumerate(prev_ids):
                             mask_prev = (seg_prev == obj_id)
-                            
-                            # Calculate IoU with each blob in current timestep
-                            best_iou = 0
-                            best_blob_id = None
+                            centroid_prev = center_of_mass(mask_prev)
+                            size_prev = np.count_nonzero(mask_prev)
                             
                             for blob_id in range(1, num_blobs + 1):
                                 blob_mask = (labeled_blobs == blob_id)
+                                centroid_blob = center_of_mass(blob_mask)
+                                size_blob = np.count_nonzero(blob_mask)
                                 
-                                # Calculate intersection and union
+                                # Spatial constraint: check centroid distance
+                                distance = np.sqrt(np.sum((np.array(centroid_prev) - np.array(centroid_blob))**2))
+                                if distance > MAX_CENTROID_DISTANCE:
+                                    continue  # Too far, skip this blob
+                                
+                                # Size constraint: check size ratio
+                                size_ratio = size_blob / size_prev if size_prev > 0 else 1.0
+                                if size_ratio > MAX_SIZE_RATIO or size_ratio < (1.0 / MAX_SIZE_RATIO):
+                                    continue  # Size changed too much, skip this blob
+                                
+                                # Calculate IoU
                                 intersection = np.sum(mask_prev & blob_mask)
                                 union = np.sum(mask_prev | blob_mask)
                                 
                                 if union > 0:
                                     iou = intersection / union
-                                    if iou > best_iou:
-                                        best_iou = iou
-                                        best_blob_id = blob_id
+                                    # Use negative IoU as cost (we minimize cost, want to maximize IoU)
+                                    cost_matrix[i, blob_id - 1] = -iou
+                        
+                        # Use Hungarian algorithm for optimal 1-to-1 assignment
+                        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                        
+                        # Apply assignments
+                        objects_propagated = 0
+                        assigned_neurons = set()
+                        
+                        for i, j in zip(row_ind, col_ind):
+                            obj_id = prev_ids[i]
+                            iou = -cost_matrix[i, j]  # Convert back to positive IoU
                             
-                            # Propagate with best match found (backward direction)
-                            if best_blob_id is not None:
-                                # Use the matched blob and expand it to include dim edges
-                                new_mask = (labeled_blobs == best_blob_id)
-                                # Dilate by 2 pixels to capture edges that fall below threshold
-                                new_mask = binary_dilation(new_mask, iterations=2)
+                            # Check if this is a valid assignment
+                            if iou > 0:  # Any positive IoU is considered
+                                blob_id = j + 1
+                                new_mask = (labeled_blobs == blob_id)
+                                # NO dilation to prevent merging with nearby neurons
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
+                                assigned_neurons.add(obj_id)
                                 
-                                # Warn if IOU is below normal threshold
-                                if best_iou < MIN_IOU_THRESHOLD:
-                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({best_iou:.3f} < {MIN_IOU_THRESHOLD}) - using fallback match")
-                            else:
-                                # No overlapping blobs found - use fallback from next timestep (going backward)
-                                # Copy the mask from t+1 to maintain continuity
+                                # Warn if IoU is below normal threshold
+                                if iou < MIN_IOU_THRESHOLD:
+                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({iou:.3f} < {MIN_IOU_THRESHOLD}) - using Hungarian match")
+                        
+                        # Handle neurons that weren't assigned (copy from next timestep)
+                        for obj_id in prev_ids:
+                            if obj_id not in assigned_neurons:
+                                mask_prev = (seg_prev == obj_id)
                                 new_seg[mask_prev] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
-                                pixels_count = np.count_nonzero(mask_prev)
-                                print(f"    ⚠ Object {obj_id} at t={t}: No blobs found, copied {pixels_count} pixels from t={t+1} (fallback)")
                         
-                        # Update segmentation_4d
-                        if new_seg.max() > 0:
-                            self.segmentation_4d[t] = new_seg
+                        # Always write the new segmentation back to the 4D array
+                        self.segmentation_4d[t] = new_seg
                     
-                    # Refresh viewer
+                    # Refresh all relevant viewer layers
                     if "committed_objects_4d" in self._viewer.layers:
                         self._viewer.layers["committed_objects_4d"].refresh()
+                    if self._current_label_layer is not None:
+                        self._current_label_layer.refresh()
                     
                     print(f"\n{'='*60}")
                     print(f"✅ Propagated segmentation across {self.n_timesteps} timesteps")

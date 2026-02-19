@@ -103,7 +103,7 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:900]
+    image4d = image4d[1:30]
     
     #    image4d = image4d[10:900]
     
