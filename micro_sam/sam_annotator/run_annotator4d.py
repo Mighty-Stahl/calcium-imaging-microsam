@@ -70,8 +70,8 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz"
-
+    default_npz_path = "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
+   # default_npz_path = "calcium_extracted_gaussian_full.npz"
 # "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
 
 
@@ -103,7 +103,7 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:30]
+    image4d = image4d[1:200]
     
     #    image4d = image4d[10:900]
     

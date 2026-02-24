@@ -356,8 +356,8 @@ class TimestepToolsWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout()
         self.setLayout(layout)
 
-        btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps (Shift+S)")
-        btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps (C)")
+        btn_segment = QtWidgets.QPushButton("Segment Object (Shift+S)")
+        btn_commit = QtWidgets.QPushButton("Commit Object (C)")
         btn_propagate_points = QtWidgets.QPushButton("Propagate point prompts to all timesteps")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
@@ -841,6 +841,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         self.segmentation_4d = None
         self.auto_segmentation_4d = None
         self.current_object_4d = None
+        self.committed_objects_4d = None
         # 4D-aware point prompts: dict mapping timestep -> points array
         self.point_prompts_4d = {}
         # Persistent point-to-ID mapping: key=(t,z,y,x) -> value=ID
@@ -1680,16 +1681,46 @@ class MicroSAM4DAnnotator(Annotator3d):
                     print(f"🔄 Propagating {len(current_ids)} objects from timestep {current_t}")
                     print(f"{'='*60}")
                     
-                    # Search radius for local maximum detection
-                    SEARCH_RADIUS = 10
-                    MAX_SHIFT_DISTANCE = 40  # Maximum allowed shift between timesteps
+                    # Propagation parameters - relaxed for better tracking
+                    MIN_IOU_THRESHOLD = 0.25  # Minimum IoU to consider a match (lowered for dim neurons)
+                    MAX_CENTROID_DISTANCE = 50  # Max pixels a neuron can move per timestep (increased)
+                    MAX_SIZE_RATIO = 4.0  # Max size change ratio (increased for brightness changes)
+                    BLOB_PERCENTILE = 20  # Lower threshold for blob detection (catches dim neurons)
                     
                     total_propagated = 0
                     
+                    # Helper function: Watershed split merged blobs
+                    def watershed_split_blob(blob_mask, img, seed_centroids):
+                        """Split a merged blob using watershed with predicted centroids as seeds."""
+                        if len(seed_centroids) < 2:
+                            return blob_mask.astype(np.int32)
+                        
+                        # Create markers from seed centroids
+                        markers = np.zeros_like(blob_mask, dtype=np.int32)
+                        marker_id = 1
+                        
+                        for z, y, x in seed_centroids:
+                            z, y, x = int(z), int(y), int(x)
+                            if (0 <= z < blob_mask.shape[0] and 
+                                0 <= y < blob_mask.shape[1] and 
+                                0 <= x < blob_mask.shape[2] and
+                                blob_mask[z, y, x]):
+                                markers[z, y, x] = marker_id
+                                marker_id += 1
+                        
+                        # Check if we have enough valid markers
+                        if marker_id < 3:  # Need at least 2 markers
+                            return blob_mask.astype(np.int32)
+                        
+                        # Distance transform for watershed
+                        distance = distance_transform_edt(blob_mask)
+                        
+                        # Watershed segmentation
+                        separated = watershed(-distance, markers, mask=blob_mask)
+                        
+                        return separated
+                    
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
-                    MIN_IOU_THRESHOLD = 0.3  # Minimum IoU to consider a match
-                    MAX_CENTROID_DISTANCE = 25  # Max pixels a neuron can move per timestep
-                    MAX_SIZE_RATIO = 2.5  # Max size change ratio (neuron can't grow/shrink more than 2.5x)
                     
                     for t in range(current_t + 1, self.n_timesteps):
                         seg_prev = self.segmentation_4d[t - 1]
@@ -1703,8 +1734,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                         if len(prev_ids) == 0:
                             continue
                         
-                        # Label blobs in current timestep
-                        threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
+                        # STEP 1: Detect blobs with LOWER threshold (better sensitivity)
+                        threshold = np.percentile(img_curr[img_curr > 0], BLOB_PERCENTILE) if np.any(img_curr > 0) else 0
                         foreground_mask = img_curr > threshold
                         labeled_blobs, num_blobs = label(foreground_mask)
                         
@@ -1716,28 +1747,81 @@ class MicroSAM4DAnnotator(Annotator3d):
                             self.segmentation_4d[t] = new_seg
                             continue
                         
-                        # Build cost matrix for Hungarian algorithm with spatial and size constraints
-                        cost_matrix = np.ones((len(prev_ids), num_blobs)) * 1e6  # Large cost = invalid
+                        # STEP 2: Detect conflicts (multiple neurons claiming same blob)
+                        blob_claims = {}  # blob_id -> [list of obj_ids]
+                        neuron_centroids = {}  # obj_id -> (z, y, x)
+                        
+                        for obj_id in prev_ids:
+                            mask_prev = (seg_prev == obj_id)
+                            if not mask_prev.any():
+                                continue
+                            
+                            centroid = center_of_mass(mask_prev)
+                            neuron_centroids[obj_id] = centroid
+                            
+                            # Check which blobs overlap with this neuron
+                            for blob_id in range(1, num_blobs + 1):
+                                blob_mask = (labeled_blobs == blob_id)
+                                overlap = np.sum(mask_prev & blob_mask)
+                                
+                                if overlap > 0:
+                                    if blob_id not in blob_claims:
+                                        blob_claims[blob_id] = []
+                                    blob_claims[blob_id].append(obj_id)
+                        
+                        # STEP 3: Split conflicted blobs using watershed
+                        split_blobs = labeled_blobs.copy()
+                        next_blob_id = num_blobs + 1
+                        
+                        for blob_id, claiming_neurons in blob_claims.items():
+                            if len(claiming_neurons) > 1:
+                                # CONFLICT! Multiple neurons want this blob - split it
+                                blob_mask = (labeled_blobs == blob_id)
+                                seed_centroids = [neuron_centroids[oid] for oid in claiming_neurons]
+                                
+                                # Watershed split
+                                separated = watershed_split_blob(blob_mask, img_curr, seed_centroids)
+                                
+                                # Replace merged blob with separated regions
+                                unique_regions = np.unique(separated[separated > 0])
+                                for region_id in unique_regions:
+                                    region_mask = (separated == region_id)
+                                    if region_mask.any():
+                                        split_blobs[region_mask] = next_blob_id
+                                        next_blob_id += 1
+                                
+                                # Remove original merged blob
+                                split_blobs[blob_mask & (split_blobs == blob_id)] = 0
+                        
+                        # STEP 4: Hungarian algorithm on (potentially split) blobs
+                        num_final_blobs = int(split_blobs.max())
+                        cost_matrix = np.ones((len(prev_ids), num_final_blobs)) * 1e6
                         
                         for i, obj_id in enumerate(prev_ids):
                             mask_prev = (seg_prev == obj_id)
-                            centroid_prev = center_of_mass(mask_prev)
+                            if not mask_prev.any():
+                                continue
+                            
+                            centroid_prev = neuron_centroids.get(obj_id, center_of_mass(mask_prev))
                             size_prev = np.count_nonzero(mask_prev)
                             
-                            for blob_id in range(1, num_blobs + 1):
-                                blob_mask = (labeled_blobs == blob_id)
+                            for blob_id in range(1, num_final_blobs + 1):
+                                blob_mask = (split_blobs == blob_id)
+                                if not blob_mask.any():
+                                    continue
+                                
                                 centroid_blob = center_of_mass(blob_mask)
                                 size_blob = np.count_nonzero(blob_mask)
                                 
-                                # Spatial constraint: check centroid distance
+                                # Spatial constraint
                                 distance = np.sqrt(np.sum((np.array(centroid_prev) - np.array(centroid_blob))**2))
                                 if distance > MAX_CENTROID_DISTANCE:
-                                    continue  # Too far, skip this blob
+                                    continue
                                 
-                                # Size constraint: check size ratio
+                                # Size constraint
                                 size_ratio = size_blob / size_prev if size_prev > 0 else 1.0
                                 if size_ratio > MAX_SIZE_RATIO or size_ratio < (1.0 / MAX_SIZE_RATIO):
-                                    continue  # Size changed too much, skip this blob
+                                    continue
                                 
                                 # Calculate IoU
                                 intersection = np.sum(mask_prev & blob_mask)
@@ -1745,10 +1829,9 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 
                                 if union > 0:
                                     iou = intersection / union
-                                    # Use negative IoU as cost (we minimize cost, want to maximize IoU)
                                     cost_matrix[i, blob_id - 1] = -iou
                         
-                        # Use Hungarian algorithm for optimal 1-to-1 assignment
+                        # STEP 5: Hungarian assignment
                         row_ind, col_ind = linear_sum_assignment(cost_matrix)
                         
                         # Apply assignments
@@ -1757,21 +1840,15 @@ class MicroSAM4DAnnotator(Annotator3d):
                         
                         for i, j in zip(row_ind, col_ind):
                             obj_id = prev_ids[i]
-                            iou = -cost_matrix[i, j]  # Convert back to positive IoU
+                            iou = -cost_matrix[i, j]
                             
-                            # Check if this is a valid assignment
-                            if iou > 0:  # Any positive IoU is considered
+                            if iou > 0:  # Any positive IoU is valid
                                 blob_id = j + 1
-                                new_mask = (labeled_blobs == blob_id)
-                                # NO dilation to prevent merging with nearby neurons
+                                new_mask = (split_blobs == blob_id)
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
                                 assigned_neurons.add(obj_id)
-                                
-                                # Warn if IoU is below normal threshold
-                                if iou < MIN_IOU_THRESHOLD:
-                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({iou:.3f} < {MIN_IOU_THRESHOLD}) - using Hungarian match")
                         
                         # Handle neurons that weren't assigned (copy from previous timestep)
                         for obj_id in prev_ids:
@@ -1781,7 +1858,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 objects_propagated += 1
                                 total_propagated += 1
                         
-                        # Always write the new segmentation back to the 4D array
+                        # Always write the new segmentation back
                         self.segmentation_4d[t] = new_seg
                     
                     # Backward propagation: current_t → t-1 → t-2 → ... → 0
@@ -1798,8 +1875,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                         if len(prev_ids) == 0:
                             continue
                         
-                        # Label blobs in current timestep
-                        threshold = np.percentile(img_curr[img_curr > 0], 50) if np.any(img_curr > 0) else 0
+                        # STEP 1: Detect blobs with LOWER threshold
+                        threshold = np.percentile(img_curr[img_curr > 0], BLOB_PERCENTILE) if np.any(img_curr > 0) else 0
                         foreground_mask = img_curr > threshold
                         labeled_blobs, num_blobs = label(foreground_mask)
                         
@@ -1811,28 +1888,76 @@ class MicroSAM4DAnnotator(Annotator3d):
                             self.segmentation_4d[t] = new_seg
                             continue
                         
-                        # Build cost matrix for Hungarian algorithm with spatial and size constraints
-                        cost_matrix = np.ones((len(prev_ids), num_blobs)) * 1e6  # Large cost = invalid
+                        # STEP 2: Detect conflicts
+                        blob_claims = {}
+                        neuron_centroids = {}
                         
-                        for i, obj_id in enumerate(prev_ids):
+                        for obj_id in prev_ids:
                             mask_prev = (seg_prev == obj_id)
-                            centroid_prev = center_of_mass(mask_prev)
-                            size_prev = np.count_nonzero(mask_prev)
+                            if not mask_prev.any():
+                                continue
+                            
+                            centroid = center_of_mass(mask_prev)
+                            neuron_centroids[obj_id] = centroid
                             
                             for blob_id in range(1, num_blobs + 1):
                                 blob_mask = (labeled_blobs == blob_id)
+                                overlap = np.sum(mask_prev & blob_mask)
+                                
+                                if overlap > 0:
+                                    if blob_id not in blob_claims:
+                                        blob_claims[blob_id] = []
+                                    blob_claims[blob_id].append(obj_id)
+                        
+                        # STEP 3: Split conflicted blobs using watershed
+                        split_blobs = labeled_blobs.copy()
+                        next_blob_id = num_blobs + 1
+                        
+                        for blob_id, claiming_neurons in blob_claims.items():
+                            if len(claiming_neurons) > 1:
+                                blob_mask = (labeled_blobs == blob_id)
+                                seed_centroids = [neuron_centroids[oid] for oid in claiming_neurons]
+                                
+                                separated = watershed_split_blob(blob_mask, img_curr, seed_centroids)
+                                
+                                unique_regions = np.unique(separated[separated > 0])
+                                for region_id in unique_regions:
+                                    region_mask = (separated == region_id)
+                                    if region_mask.any():
+                                        split_blobs[region_mask] = next_blob_id
+                                        next_blob_id += 1
+                                
+                                split_blobs[blob_mask & (split_blobs == blob_id)] = 0
+                        
+                        # STEP 4: Hungarian algorithm on split blobs
+                        num_final_blobs = int(split_blobs.max())
+                        cost_matrix = np.ones((len(prev_ids), num_final_blobs)) * 1e6
+                        
+                        for i, obj_id in enumerate(prev_ids):
+                            mask_prev = (seg_prev == obj_id)
+                            if not mask_prev.any():
+                                continue
+                            
+                            centroid_prev = neuron_centroids.get(obj_id, center_of_mass(mask_prev))
+                            size_prev = np.count_nonzero(mask_prev)
+                            
+                            for blob_id in range(1, num_final_blobs + 1):
+                                blob_mask = (split_blobs == blob_id)
+                                if not blob_mask.any():
+                                    continue
+                                
                                 centroid_blob = center_of_mass(blob_mask)
                                 size_blob = np.count_nonzero(blob_mask)
                                 
-                                # Spatial constraint: check centroid distance
+                                # Spatial constraint
                                 distance = np.sqrt(np.sum((np.array(centroid_prev) - np.array(centroid_blob))**2))
                                 if distance > MAX_CENTROID_DISTANCE:
-                                    continue  # Too far, skip this blob
+                                    continue
                                 
-                                # Size constraint: check size ratio
+                                # Size constraint
                                 size_ratio = size_blob / size_prev if size_prev > 0 else 1.0
                                 if size_ratio > MAX_SIZE_RATIO or size_ratio < (1.0 / MAX_SIZE_RATIO):
-                                    continue  # Size changed too much, skip this blob
+                                    continue
                                 
                                 # Calculate IoU
                                 intersection = np.sum(mask_prev & blob_mask)
@@ -1840,35 +1965,27 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 
                                 if union > 0:
                                     iou = intersection / union
-                                    # Use negative IoU as cost (we minimize cost, want to maximize IoU)
                                     cost_matrix[i, blob_id - 1] = -iou
                         
-                        # Use Hungarian algorithm for optimal 1-to-1 assignment
+                        # STEP 5: Hungarian assignment
                         row_ind, col_ind = linear_sum_assignment(cost_matrix)
                         
-                        # Apply assignments
                         objects_propagated = 0
                         assigned_neurons = set()
                         
                         for i, j in zip(row_ind, col_ind):
                             obj_id = prev_ids[i]
-                            iou = -cost_matrix[i, j]  # Convert back to positive IoU
+                            iou = -cost_matrix[i, j]
                             
-                            # Check if this is a valid assignment
-                            if iou > 0:  # Any positive IoU is considered
+                            if iou > 0:
                                 blob_id = j + 1
-                                new_mask = (labeled_blobs == blob_id)
-                                # NO dilation to prevent merging with nearby neurons
+                                new_mask = (split_blobs == blob_id)
                                 new_seg[new_mask & (new_seg == 0)] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
                                 assigned_neurons.add(obj_id)
-                                
-                                # Warn if IoU is below normal threshold
-                                if iou < MIN_IOU_THRESHOLD:
-                                    print(f"    ⚠ Object {obj_id} at t={t}: Low IoU ({iou:.3f} < {MIN_IOU_THRESHOLD}) - using Hungarian match")
                         
-                        # Handle neurons that weren't assigned (copy from next timestep)
+                        # Handle neurons that weren't assigned
                         for obj_id in prev_ids:
                             if obj_id not in assigned_neurons:
                                 mask_prev = (seg_prev == obj_id)
@@ -1876,14 +1993,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 objects_propagated += 1
                                 total_propagated += 1
                         
-                        # Always write the new segmentation back to the 4D array
+                        # Always write the new segmentation back
                         self.segmentation_4d[t] = new_seg
                     
                     # Refresh all relevant viewer layers
                     if "committed_objects_4d" in self._viewer.layers:
                         self._viewer.layers["committed_objects_4d"].refresh()
-                    if self._current_label_layer is not None:
-                        self._current_label_layer.refresh()
+                    if "current_object_4d" in self._viewer.layers:
+                        self._viewer.layers["current_object_4d"].refresh()
                     
                     print(f"\n{'='*60}")
                     print(f"✅ Propagated segmentation across {self.n_timesteps} timesteps")
@@ -1894,7 +2011,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                         f"✓ Propagated segmentation\n\n"
                         f"Source timestep: {current_t}\n"
                         f"Objects tracked: {len(current_ids)}\n"
-                        f"Method: IoU-based matching (threshold: {MIN_IOU_THRESHOLD})"
+                        f"Method: Hungarian + Watershed splitting\n"
+                        f"IoU threshold: {MIN_IOU_THRESHOLD}, Distance: {MAX_CENTROID_DISTANCE}px"
                     )
                     
                 except Exception as e:
@@ -2283,15 +2401,48 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             # don't fail initialization if Qt isn't available
             pass
+        
+        # Set maximum width for the dock widget to make it less wide
+        try:
+            if hasattr(self, '_annotator_widget'):
+                self._annotator_widget.setMaximumWidth(550)
+        except Exception:
+            pass
     
     def _create_keybindings(self):
         """Override base class keybindings with 4D-specific shortcuts.
         
         4D annotator keybindings:
+        - s: Segment current object (single slice, like original micro-sam)
         - Shift+S: Segment all objects across timesteps
         - Shift+P: Segment + Propagate current segmentation across time
+        - c: Commit current segmentation
         - C: Commit all timesteps
         """
+        # DON'T call parent _create_keybindings since we deleted the widgets it references
+        # Instead, implement keybindings directly here
+        
+        # 's' key: segment at current timestep
+        @self._viewer.bind_key("s", overwrite=True)
+        def _segment(viewer):
+            try:
+                self._segment_current_object()
+            except Exception as e:
+                print(f"Error in segment: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 'c' key: commit current timestep
+        @self._viewer.bind_key("c", overwrite=True)
+        def _commit(viewer):
+            try:
+                self.commit_current_timestep()
+            except Exception as e:
+                print(f"Error in commit: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Override Shift+S for batch segmentation
         @self._viewer.bind_key("Shift-S", overwrite=True)
         def _segment_all_timesteps(viewer):
             try:
@@ -2301,6 +2452,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                 import traceback
                 traceback.print_exc()
         
+        # Override Shift+P for propagation
         @self._viewer.bind_key("Shift-P", overwrite=True)
         def _segment_and_propagate(viewer):
             try:
@@ -2315,7 +2467,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                 import traceback
                 traceback.print_exc()
         
-        @self._viewer.bind_key("c", overwrite=True)
+        # Override Shift+C for commit all (keeping lowercase 'c' for single commit from parent)
+        @self._viewer.bind_key("Shift-C", overwrite=True)
         def _commit_all_timesteps(viewer):
             try:
                 self.commit_all_timesteps()
@@ -2323,6 +2476,175 @@ class MicroSAM4DAnnotator(Annotator3d):
                 print(f"Error in commit_all_timesteps: {e}")
                 import traceback
                 traceback.print_exc()
+
+    def _segment_current_object(self):
+        """Segment object at current timestep only (used by 's' keybinding)."""
+        try:
+            t = self.current_timestep
+            # Segment only the current timestep
+            if not hasattr(self, "point_prompts_4d") or t not in self.point_prompts_4d:
+                print(f"No point prompts at timestep {t}")
+                return
+            
+            pts = self.point_prompts_4d[t]
+            if len(pts) == 0:
+                print(f"No point prompts at timestep {t}")
+                return
+            
+            # Use the existing segmentation logic
+            from . import util as sam_util
+            from .util import segment_mask_in_volume
+            
+            state = AnnotatorState()
+            if state.predictor is None or state.image_embeddings is None:
+                print("No embeddings available for segmentation")
+                return
+            
+            shape = self.image_4d[t].shape  # (Z, Y, X)
+            
+            # Get point layer for labels
+            point_layer = self._viewer.layers.get("point_prompts")
+            
+            # Get point labels from features and convert to SAM format
+            # Our point_type: 0=positive/green, 1=negative/red
+            # SAM expects: 1=positive, 0=negative
+            point_labels = np.ones(len(pts), dtype=int)  # Default to positive
+            if point_layer is not None and hasattr(point_layer, 'features'):
+                if 'point_type' in point_layer.features:
+                    # Convert: 0->1 (positive), 1->0 (negative)
+                    point_labels = 1 - point_layer.features['point_type'].values
+            
+            # Group points by Z-slice
+            points_by_z = {}
+            labels_by_z = {}
+            for idx, point in enumerate(pts):
+                z = int(point[0])
+                if z not in points_by_z:
+                    points_by_z[z] = []
+                    labels_by_z[z] = []
+                points_by_z[z].append(point[1:])
+                labels_by_z[z].append(point_labels[idx] if idx < len(point_labels) else 1)
+            
+            # Segment each Z-slice
+            seg_id = np.zeros(shape, dtype=np.uint32)
+            segmented_slices = []
+            
+            for z, pos_points in points_by_z.items():
+                slice_points = np.array(pos_points)
+                slice_labels = np.array(labels_by_z[z])
+                
+                try:
+                    mask_2d = sam_util.prompt_segmentation(
+                        state.predictor,
+                        slice_points,
+                        slice_labels,
+                        boxes=np.array([]),
+                        masks=None,
+                        shape=shape[1:],
+                        multiple_box_prompts=False,
+                        i=z,
+                        image_embeddings=state.image_embeddings,
+                    )
+                    if mask_2d is not None and mask_2d.max() > 0:
+                        seg_id[z] = mask_2d
+                        segmented_slices.append(z)
+                except Exception as e:
+                    print(f"Error segmenting slice {z}: {e}")
+            
+            # Extend through volume
+            if len(segmented_slices) > 0:
+                try:
+                    seg_id, _ = segment_mask_in_volume(
+                        seg_id,
+                        state.predictor,
+                        state.image_embeddings,
+                        np.array(segmented_slices),
+                        stop_lower=False,
+                        stop_upper=False,
+                        iou_threshold=0.65,
+                        projection="single_point",
+                        box_extension=0.05,
+                        update_progress=None,
+                    )
+                except Exception as e:
+                    print(f"Error extending segmentation: {e}")
+            
+            # Update current_object_4d
+            if seg_id.max() > 0:
+                if self.current_object_4d is None:
+                    self.current_object_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+                
+                mask = seg_id > 0
+                seg_result = np.zeros(shape, dtype=np.uint32)
+                seg_result[mask] = 1
+                self.current_object_4d[t] = seg_result
+                
+                # Update layer
+                if "current_object_4d" in self._viewer.layers:
+                    self._viewer.layers["current_object_4d"].refresh()
+                    
+                print(f"Segmented object at timestep {t}")
+            else:
+                print(f"No segmentation result at timestep {t}")
+                
+        except Exception as e:
+            print(f"Error in _segment_current_object: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def commit_current_timestep(self):
+        """Commit current_object_4d at current timestep to committed_objects_4d."""
+        try:
+            t = self.current_timestep
+            
+            if self.current_object_4d is None or self.current_object_4d[t].max() == 0:
+                print(f"No object to commit at timestep {t}")
+                return
+            
+            # Use committed_objects_4d which is synced with the layer
+            if self.committed_objects_4d is None:
+                self.committed_objects_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+            
+            # Get max ID in committed objects to offset new IDs
+            max_id = self.committed_objects_4d.max()
+            
+            # Get current segmentation
+            seg = self.current_object_4d[t]
+            
+            # Assign new IDs
+            mask = seg > 0
+            if mask.sum() > 0:
+                new_id = int(max_id + 1)
+                self.committed_objects_4d[t][mask] = new_id
+                
+                # Clear current object
+                self.current_object_4d[t][:] = 0
+                
+                # Clear point prompts for this timestep
+                if hasattr(self, 'point_prompts_4d') and t in self.point_prompts_4d:
+                    self.point_prompts_4d[t] = np.empty((0, 3))
+                
+                # Clear point prompts layer
+                if "point_prompts" in self._viewer.layers:
+                    point_layer = self._viewer.layers["point_prompts"]
+                    point_layer.data = np.empty((0, 3))
+                    # Clear features too
+                    if hasattr(point_layer, 'features') and len(point_layer.features) > 0:
+                        point_layer.features['point_type'] = np.array([], dtype=int)
+                        point_layer.features['label'] = np.array([], dtype=object)
+                
+                # Update layers
+                if "committed_objects_4d" in self._viewer.layers:
+                    self._viewer.layers["committed_objects_4d"].refresh()
+                if "current_object_4d" in self._viewer.layers:
+                    self._viewer.layers["current_object_4d"].refresh()
+                
+                print(f"Committed object {new_id} at timestep {t}")
+            
+        except Exception as e:
+            print(f"Error in commit_current_timestep: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _reorder_layers(self):
         """Reorder layers according to desired order and persist across timestep changes."""
@@ -2408,11 +2730,15 @@ class MicroSAM4DAnnotator(Annotator3d):
 
         # add or update persistent 4D labels layers so Napari edits directly
         # mutate the underlying 4D arrays (no per-timestep recreation)
+        # Initialize committed_objects_4d if needed
+        if self.committed_objects_4d is None:
+            self.committed_objects_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+        
         try:
             if "committed_objects_4d" in self._viewer.layers:
-                self._viewer.layers["committed_objects_4d"].data = self.segmentation_4d
+                self._viewer.layers["committed_objects_4d"].data = self.committed_objects_4d
             else:
-                self._viewer.add_labels(data=self.segmentation_4d, name="committed_objects_4d")
+                self._viewer.add_labels(data=self.committed_objects_4d, name="committed_objects_4d")
         except Exception:
             pass
 
@@ -2437,26 +2763,50 @@ class MicroSAM4DAnnotator(Annotator3d):
             tools_layout = QtWidgets.QVBoxLayout()
             tools_container.setLayout(tools_layout)
             
-            # Add checkbox to control negative prompts from other objects
-            self._use_negative_prompts_checkbox = QtWidgets.QCheckBox("Use other prompts as negative")
-            self._use_negative_prompts_checkbox.setChecked(True)
-            self._use_negative_prompts_checkbox.setToolTip(
-                "When enabled, points from other objects are used as negative prompts\n"
-                "to prevent overlap. Disable for faster segmentation or when objects\n"
-                "are far apart."
-            )
-            tools_layout.addWidget(self._use_negative_prompts_checkbox)
+            # Removed multi-ID system - using standard micro-sam single object workflow
+            # All points belong to one object, segment with 's', commit with 'c'
+            
+            # Store current point mode (0=positive/green, 1=negative/red)
+            # Values match color_cycle index: ["green", "red"]
+            self._point_mode = 0
+            
+            # Add dropdown for positive/negative points
+            point_type_row = QtWidgets.QWidget()
+            point_type_layout = QtWidgets.QHBoxLayout()
+            point_type_row.setLayout(point_type_layout)
+            
+            point_type_label = QtWidgets.QLabel("<b>Point Mode:</b>")
+            point_type_layout.addWidget(point_type_label)
+            
+            self._point_mode_dropdown = QtWidgets.QComboBox()
+            self._point_mode_dropdown.addItem("✓ Positive (Green)", 0)  # 0 = green (first in color_cycle)
+            self._point_mode_dropdown.addItem("✗ Negative (Red)", 1)    # 1 = red (second in color_cycle)
+            self._point_mode_dropdown.setCurrentIndex(0)  # Default to positive
+            self._point_mode_dropdown.setToolTip("Select point type:\n• Positive (Green): Include regions\n• Negative (Red): Exclude regions")
+            
+            def on_mode_changed(index):
+                # Get the mode value (0 or 1) from the selected item
+                self._point_mode = self._point_mode_dropdown.itemData(index)
+                # Update feature_defaults if layer has points
+                if "point_prompts" in self._viewer.layers:
+                    layer = self._viewer.layers["point_prompts"]
+                    if hasattr(layer, 'data') and len(layer.data) > 0:
+                        if hasattr(layer, 'features') and 'point_type' in layer.features:
+                            layer.feature_defaults = {
+                                'point_type': self._point_mode,
+                                'label': str(self._point_mode)
+                            }
+            
+            self._point_mode_dropdown.currentIndexChanged.connect(on_mode_changed)
+            
+            point_type_layout.addWidget(self._point_mode_dropdown)
+            tools_layout.addWidget(point_type_row)
             
             # Add the small 4D timestep tools widget (segment/commit across T)
             tools_layout.addWidget(TimestepToolsWidget(self))
             
-            # Add Point Prompt Manager Widget for ID-based segmentation
-            self._point_manager_widget = PointPromptManagerWidget(self)
-            tools_layout.addWidget(self._point_manager_widget)
-            
-            # Add Object Commit Widget for individual object commits
-            self._object_commit_widget = ObjectCommitWidget(self)
-            tools_layout.addWidget(self._object_commit_widget)
+            # Removed Point Prompt Manager Widget - single object workflow
+            # Removed Object Commit Widget - single object workflow
             
             # Add the container to the annotator widget
             self._annotator_widget.layout().addWidget(tools_container)
@@ -2465,18 +2815,6 @@ class MicroSAM4DAnnotator(Annotator3d):
             # Fallback to old method if styling fails
             try:
                 self._annotator_widget.layout().addWidget(TimestepToolsWidget(self))
-            except Exception:
-                pass
-            
-            try:
-                self._point_manager_widget = PointPromptManagerWidget(self)
-                self._annotator_widget.layout().addWidget(self._point_manager_widget)
-            except Exception:
-                pass
-            
-            try:
-                self._object_commit_widget = ObjectCommitWidget(self)
-                self._annotator_widget.layout().addWidget(self._object_commit_widget)
             except Exception:
                 pass
 
@@ -2501,9 +2839,6 @@ class MicroSAM4DAnnotator(Annotator3d):
             t = getattr(self, "current_timestep", 0)
             pts_t = np.array(self.point_prompts_4d.get(t, np.empty((0, 3))))
             
-            # Get point IDs based on coordinates
-            point_ids = self._get_point_ids_for_timestep(t, pts_t)
-
             # if layer exists, update its data
             if "point_prompts" in self._viewer.layers:
                 layer = self._viewer.layers["point_prompts"]
@@ -2511,10 +2846,30 @@ class MicroSAM4DAnnotator(Annotator3d):
             else:
                 layer = self._viewer.add_points(pts_t, name="point_prompts", size=10,
                                                 face_color="green", edge_color="green",
-                                                edge_width=0, blending="translucent", ndim=3)
+                                                edge_width=2, blending="translucent", ndim=3)
+                # Set up positive/negative color cycle (green=positive, red=negative)
+                # Use napari's built-in feature system for point types
+                layer.face_color_cycle = ["green", "red"]
+                layer.edge_color_cycle = ["green", "red"]
                 
-            # Set up color mapping based on IDs
-            self._update_point_colors(layer, point_ids)
+                # Set up features for point type (0=positive/green, 1=negative/red)
+                # Also add 'label' feature for compatibility with base class widgets
+                if len(pts_t) > 0:
+                    layer.features = {
+                        'point_type': np.zeros(len(pts_t), dtype=int),  # 0 = positive/green by default
+                        'label': np.array(['0'] * len(pts_t))  # String labels for compatibility
+                    }
+                    layer.face_color = 'point_type'
+                    layer.edge_color = 'point_type'
+                    # Default new points based on current mode
+                    layer.feature_defaults = {
+                        'point_type': getattr(self, '_point_mode', 0),
+                        'label': str(getattr(self, '_point_mode', 0))
+                    }
+                else:
+                    # Don't set features or feature_defaults for empty layer
+                    # They will be set when first point is added
+                    pass
                 
             # Setup cursor handling for point prompts layer
             try:
@@ -2574,6 +2929,61 @@ class MicroSAM4DAnnotator(Annotator3d):
                 new_data = np.array(layer.data)
                 old_data = self.point_prompts_4d.get(t_now, np.empty((0, 3)))
                 
+                # Get current point mode
+                point_mode = getattr(self, '_point_mode', 1)
+                
+                # If this is the first point added, set up features
+                if len(old_data) == 0 and len(new_data) > 0:
+                    # Initialize features and feature_defaults
+                    if not hasattr(layer, 'features') or len(layer.features) == 0 or 'point_type' not in layer.features:
+                        layer.features = {
+                            'point_type': np.full(len(new_data), point_mode, dtype=int),
+                            'label': np.array([str(point_mode)] * len(new_data))  # String labels for compatibility
+                        }
+                        layer.face_color = 'point_type'
+                        layer.edge_color = 'point_type'
+                        layer.face_color_cycle = ["green", "red"]
+                        layer.edge_color_cycle = ["green", "red"]
+                        layer.feature_defaults = {
+                            'point_type': point_mode,
+                            'label': str(point_mode)
+                        }
+                    else:
+                        # Features exist but may have wrong values - update them
+                        if 'point_type' in layer.features:
+                            layer.features['point_type'] = np.full(len(new_data), point_mode, dtype=int)
+                            layer.features['label'] = np.array([str(point_mode)] * len(new_data))
+                            layer.feature_defaults = {
+                                'point_type': point_mode,
+                                'label': str(point_mode)
+                            }
+                
+                # If new points were added, make sure they have the right point_type
+                elif len(new_data) > len(old_data):
+                    if hasattr(layer, 'features') and 'point_type' in layer.features:
+                        # Update feature_defaults
+                        layer.feature_defaults = {
+                            'point_type': point_mode,
+                            'label': str(point_mode)
+                        }
+                        # Update the newly added points to have the correct type
+                        num_new_points = len(new_data) - len(old_data)
+                        # Set the last N points (newly added) to the current mode
+                        if len(layer.features['point_type']) >= len(new_data):
+                            for i in range(len(new_data) - num_new_points, len(new_data)):
+                                layer.features['point_type'][i] = point_mode
+                                if 'label' in layer.features:
+                                    layer.features['label'][i] = str(point_mode)
+                    
+                    # Refresh the layer to update colors
+                    try:
+                        layer.refresh_colors()
+                    except AttributeError:
+                        try:
+                            layer.refresh()
+                        except Exception:
+                            pass
+                
                 # Detect new points and assign incrementing IDs
                 for pt in new_data:
                     key = (int(t_now), int(pt[0]), int(pt[1]), int(pt[2]))
@@ -2585,9 +2995,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                 # Update point data
                 self.point_prompts_4d[t_now] = new_data
                 
-                # Update colors based on coordinate-based IDs
-                point_ids = self._get_point_ids_for_timestep(t_now, new_data)
-                self._update_point_colors(layer, point_ids)
+                # Points use face_color_cycle [green, red] for positive/negative
+                # No need to manually update colors - napari handles it via features
                 
                 # Refresh point manager widget if it exists
                 if hasattr(self, "_point_manager_widget"):
@@ -5000,8 +5409,27 @@ class MicroSAM4DAnnotator(Annotator3d):
                 elif "point_prompts" not in self._viewer.layers:
                     point_layer = self._viewer.add_points(pts_arr, name="point_prompts", size=10,
                                                           face_color="green", edge_color="green",
-                                                          edge_width=0, blending="translucent")
-                    point_layer.face_color_cycle = ["limegreen", "red"]
+                                                          edge_width=2, blending="translucent")
+                    # Set up positive/negative color cycle (green=positive, red=negative)
+                    point_layer.face_color_cycle = ["green", "red"]
+                    point_layer.edge_color_cycle = ["green", "red"]
+                    
+                    # Set up features for point type
+                    if len(pts_arr) > 0:
+                        point_layer.features = {
+                            'point_type': np.zeros(len(pts_arr), dtype=int),  # 0 = positive/green by default
+                            'label': np.array(['0'] * len(pts_arr))  # String labels for compatibility
+                        }
+                        point_layer.face_color = 'point_type'
+                        point_layer.edge_color = 'point_type'
+                        # Default new points to positive (only set when features exist)
+                        point_layer.feature_defaults = {
+                            'point_type': 0,
+                            'label': '0'
+                        }
+                    else:
+                        # Don't set features or feature_defaults for empty layer
+                        pass
                     
                     # Setup cursor handling for point prompts layer
                     try:
@@ -5071,75 +5499,43 @@ class MicroSAM4DAnnotator(Annotator3d):
                 # Initialize merged segmentation
                 seg_merged = np.zeros(shape, dtype=np.uint32)
                 
-                # Get point IDs based on coordinates
-                point_ids = self._get_point_ids_for_timestep(t, pts_arr)
-                
-                # Convert point prompts to the format expected by segment_slices_with_prompts
+                # SIMPLIFIED: All points are for ONE object (standard micro-sam workflow)
+                # No multiple IDs - just segment all points together
                 if len(pts_arr) > 0:
-                    # Group points by their assigned ID
-                    points_by_id = {}
-                    for point_idx, point in enumerate(pts_arr):
-                        point_id = point_ids[point_idx] if point_idx < len(point_ids) else 1
-                        if point_id not in points_by_id:
-                            points_by_id[point_id] = []
-                        points_by_id[point_id].append((point_idx, point))
-                    
                     # Get box prompts layer (usually empty for point-based workflow)
                     box_layer = self._viewer.layers["prompts"] if "prompts" in self._viewer.layers else None
                     
-                # Process each ID group separately - NEW APPROACH: Segment ALL slices with points
-                prompt_count = 0
-                for target_id, points_list in points_by_id.items():
-                    prompt_count += 1
-                    print(f"Segmenting prompt {prompt_count}", end="", flush=True)
+                    # Get point labels from features and convert to SAM format
+                    # Our point_type: 0=positive/green, 1=negative/red
+                    # SAM expects: 1=positive, 0=negative
+                    point_labels = np.ones(len(pts_arr), dtype=int)  # Default to positive
+                    if point_layer is not None and hasattr(point_layer, 'features'):
+                        if 'point_type' in point_layer.features:
+                            # Convert: 0->1 (positive), 1->0 (negative)
+                            point_labels = 1 - point_layer.features['point_type'].values
                     
-                    # Extract just the coordinates for this ID
-                    id_points = np.array([point for _, point in points_list])
+                    print(f"Segmenting object at timestep {t} ({np.sum(point_labels==1)} positive, {np.sum(point_labels==0)} negative)", end="", flush=True)
                     
-                    # Collect negative prompts from all OTHER IDs to prevent overlap
-                    # Only if the checkbox is enabled
-                    negative_points = []
-                    use_negative = getattr(self, '_use_negative_prompts_checkbox', None)
-                    if use_negative is not None and use_negative.isChecked():
-                        for other_id, other_points_list in points_by_id.items():
-                            if other_id != target_id:
-                                for _, other_point in other_points_list:
-                                    negative_points.append(other_point)
-                    
-                    # NEW APPROACH: Segment ALL slices that have points (not just the first one)
-                    # Group points by Z-slice
+                    # All points go into one segmentation
+                    # Group points by Z-slice with their labels
                     points_by_z = {}
-                    for point in id_points:
+                    labels_by_z = {}
+                    for idx, point in enumerate(pts_arr):
                         z = int(point[0])
                         if z not in points_by_z:
                             points_by_z[z] = []
+                            labels_by_z[z] = []
                         points_by_z[z].append(point[1:])  # Store (Y, X) only
+                        labels_by_z[z].append(point_labels[idx] if idx < len(point_labels) else 1)
                     
-                    # Also group negative points by Z-slice
-                    negative_by_z = {}
-                    if len(negative_points) > 0:
-                        for neg_point in negative_points:
-                            z = int(neg_point[0])
-                            if z not in negative_by_z:
-                                negative_by_z[z] = []
-                            negative_by_z[z].append(neg_point[1:])  # Store (Y, X) only
-                    
-                    # Segment each Z-slice that has points for this ID
+                    # Segment each Z-slice that has points
                     seg_id = np.zeros(shape, dtype=np.uint32)
                     segmented_slices = []
                     
                     for z, pos_points in points_by_z.items():
-                        # Combine positive and negative points for this slice
-                        slice_points = pos_points.copy()
-                        slice_labels = [1] * len(pos_points)  # positive labels
-                        
-                        # Add negative points from other IDs on this slice
-                        if z in negative_by_z:
-                            slice_points.extend(negative_by_z[z])
-                            slice_labels.extend([0] * len(negative_by_z[z]))  # negative labels
-                        
-                        slice_points = np.array(slice_points)
-                        slice_labels = np.array(slice_labels)
+                        # Get points and labels for this slice
+                        slice_points = np.array(pos_points)
+                        slice_labels = np.array(labels_by_z[z])
                         
                         # Segment this slice
                         try:
@@ -5178,13 +5574,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                         except Exception:
                             pass
                     
-                    # Add ID-specific segmentation to merged result with target ID
-                    # Only assign pixels that haven't been claimed by previous objects
+                    # Assign to merged segmentation with ID=1 (standard single object)
                     if seg_id.max() > 0:
                         mask = seg_id > 0
-                        # Only write to unclaimed pixels (background = 0)
-                        unclaimed_mask = (seg_merged == 0) & mask
-                        seg_merged[unclaimed_mask] = target_id
+                        seg_merged[mask] = 1  # Always use ID=1 for single object workflow
                         print(f"... Done")
                     else:
                         print(f"... Skipped")
