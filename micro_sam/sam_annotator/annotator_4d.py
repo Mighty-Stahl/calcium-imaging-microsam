@@ -1297,7 +1297,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     print(f"  Intensity range: {image_3d.min():.0f} to {image_3d.max():.0f}")
                     
                     # Fixed percentile threshold
-                    percentile = 98
+                    percentile = 98.7
                     
                     # Find threshold
                     threshold = np.percentile(image_3d, percentile)
@@ -1720,6 +1720,65 @@ class MicroSAM4DAnnotator(Annotator3d):
                         
                         return separated
                     
+                    # Helper function: Refine multi-blob masks
+                    def refine_neuron_mask(segmentation, obj_id, reference_centroid):
+                        """If a neuron mask contains multiple disconnected blobs, keep only the closest one.
+                        
+                        Args:
+                            segmentation: 3D segmentation array
+                            obj_id: Neuron ID to refine
+                            reference_centroid: (z, y, x) centroid from previous frame
+                            
+                        Returns:
+                            Refined segmentation with only the closest blob kept
+                        """
+                        mask = (segmentation == obj_id)
+                        
+                        if not mask.any():
+                            return segmentation
+                        
+                        # Detect disconnected blobs within this neuron's mask
+                        labeled_components, num_components = label(mask)
+                        
+                        if num_components <= 1:
+                            # Single blob - no refinement needed
+                            return segmentation
+                        
+                        # Multiple blobs detected - find closest to reference centroid
+                        print(f"    Neuron {obj_id}: Found {num_components} disconnected blobs, refining...")
+                        
+                        best_component = None
+                        best_distance = float('inf')
+                        
+                        for component_id in range(1, num_components + 1):
+                            component_mask = (labeled_components == component_id)
+                            component_centroid = center_of_mass(component_mask)
+                            
+                            # Calculate distance to reference centroid
+                            distance = np.sqrt(np.sum((np.array(component_centroid) - np.array(reference_centroid))**2))
+                            
+                            if distance < best_distance:
+                                best_distance = distance
+                                best_component = component_id
+                        
+                        # Keep only the closest blob
+                        refined_mask = (labeled_components == best_component)
+                        
+                        # Update segmentation: remove all blobs, then add back the correct one
+                        segmentation[mask] = 0  # Clear all blobs
+                        segmentation[refined_mask] = obj_id  # Keep only closest blob
+                        
+                        print(f"      Kept blob at distance {best_distance:.1f}px, removed {num_components - 1} others")
+                        
+                        return segmentation
+                    
+                    # Store anchor centroids for refinement (more accurate than frame-to-frame)
+                    anchor_centroids = {}
+                    for obj_id in current_ids:
+                        mask_anchor = (seg_current == obj_id)
+                        if mask_anchor.any():
+                            anchor_centroids[obj_id] = center_of_mass(mask_anchor)
+                    
                     # Forward propagation: current_t → t+1 → t+2 → ... → end
                     
                     for t in range(current_t + 1, self.n_timesteps):
@@ -1858,6 +1917,13 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 objects_propagated += 1
                                 total_propagated += 1
                         
+                        # REFINEMENT: Remove accidental merged blobs using anchor centroids
+                        # For each neuron, check if mask contains multiple disconnected blobs
+                        # Use anchor centroid (from current_t) for more accurate filtering
+                        for obj_id in prev_ids:
+                            if obj_id in anchor_centroids:
+                                new_seg = refine_neuron_mask(new_seg, obj_id, anchor_centroids[obj_id])
+                        
                         # Always write the new segmentation back
                         self.segmentation_4d[t] = new_seg
                     
@@ -1992,6 +2058,13 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 new_seg[mask_prev] = obj_id
                                 objects_propagated += 1
                                 total_propagated += 1
+                        
+                        # REFINEMENT: Remove accidental merged blobs using anchor centroids
+                        # For each neuron, check if mask contains multiple disconnected blobs
+                        # Use anchor centroid (from current_t) for more accurate filtering
+                        for obj_id in prev_ids:
+                            if obj_id in anchor_centroids:
+                                new_seg = refine_neuron_mask(new_seg, obj_id, anchor_centroids[obj_id])
                         
                         # Always write the new segmentation back
                         self.segmentation_4d[t] = new_seg
@@ -2506,7 +2579,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             point_layer = self._viewer.layers.get("point_prompts")
             
             # Get point labels from features and convert to SAM format
-            # Our point_type: 0=positive/green, 1=negative/red
+            # Our point_type: 0=positive/red, 1=negative/green
             # SAM expects: 1=positive, 0=negative
             point_labels = np.ones(len(pts), dtype=int)  # Default to positive
             if point_layer is not None and hasattr(point_layer, 'features'):
@@ -2766,8 +2839,8 @@ class MicroSAM4DAnnotator(Annotator3d):
             # Removed multi-ID system - using standard micro-sam single object workflow
             # All points belong to one object, segment with 's', commit with 'c'
             
-            # Store current point mode (0=positive/green, 1=negative/red)
-            # Values match color_cycle index: ["green", "red"]
+            # Store current point mode (0=positive/red, 1=negative/green)
+            # Values match color_cycle index: ["red", "green"]
             self._point_mode = 0
             
             # Add dropdown for positive/negative points
@@ -2779,10 +2852,10 @@ class MicroSAM4DAnnotator(Annotator3d):
             point_type_layout.addWidget(point_type_label)
             
             self._point_mode_dropdown = QtWidgets.QComboBox()
-            self._point_mode_dropdown.addItem("✓ Positive (Green)", 0)  # 0 = green (first in color_cycle)
-            self._point_mode_dropdown.addItem("✗ Negative (Red)", 1)    # 1 = red (second in color_cycle)
+            self._point_mode_dropdown.addItem("✓ Positive (Red)", 0)  # 0 = red (first in color_cycle)
+            self._point_mode_dropdown.addItem("✗ Negative (Green)", 1)    # 1 = green (second in color_cycle)
             self._point_mode_dropdown.setCurrentIndex(0)  # Default to positive
-            self._point_mode_dropdown.setToolTip("Select point type:\n• Positive (Green): Include regions\n• Negative (Red): Exclude regions")
+            self._point_mode_dropdown.setToolTip("Select point type:\n• Positive (Red): Include regions\n• Negative (Green): Exclude regions")
             
             def on_mode_changed(index):
                 # Get the mode value (0 or 1) from the selected item
@@ -2847,16 +2920,16 @@ class MicroSAM4DAnnotator(Annotator3d):
                 layer = self._viewer.add_points(pts_t, name="point_prompts", size=10,
                                                 face_color="green", edge_color="green",
                                                 edge_width=2, blending="translucent", ndim=3)
-                # Set up positive/negative color cycle (green=positive, red=negative)
+                # Set up positive/negative color cycle (red=positive, green=negative)
                 # Use napari's built-in feature system for point types
-                layer.face_color_cycle = ["green", "red"]
-                layer.edge_color_cycle = ["green", "red"]
+                layer.face_color_cycle = ["red", "green"]
+                layer.edge_color_cycle = ["red", "green"]
                 
-                # Set up features for point type (0=positive/green, 1=negative/red)
+                # Set up features for point type (0=positive/red, 1=negative/green)
                 # Also add 'label' feature for compatibility with base class widgets
                 if len(pts_t) > 0:
                     layer.features = {
-                        'point_type': np.zeros(len(pts_t), dtype=int),  # 0 = positive/green by default
+                        'point_type': np.zeros(len(pts_t), dtype=int),  # 0 = positive/red by default
                         'label': np.array(['0'] * len(pts_t))  # String labels for compatibility
                     }
                     layer.face_color = 'point_type'
@@ -2995,7 +3068,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                 # Update point data
                 self.point_prompts_4d[t_now] = new_data
                 
-                # Points use face_color_cycle [green, red] for positive/negative
+                # Points use face_color_cycle [red, green] for positive/negative
                 # No need to manually update colors - napari handles it via features
                 
                 # Refresh point manager widget if it exists
@@ -5408,16 +5481,16 @@ class MicroSAM4DAnnotator(Annotator3d):
                         point_layer.data = pts_arr
                 elif "point_prompts" not in self._viewer.layers:
                     point_layer = self._viewer.add_points(pts_arr, name="point_prompts", size=10,
-                                                          face_color="green", edge_color="green",
+                                                          face_color="red", edge_color="red",
                                                           edge_width=2, blending="translucent")
-                    # Set up positive/negative color cycle (green=positive, red=negative)
-                    point_layer.face_color_cycle = ["green", "red"]
-                    point_layer.edge_color_cycle = ["green", "red"]
+                    # Set up positive/negative color cycle (red=positive, green=negative)
+                    point_layer.face_color_cycle = ["red", "green"]
+                    point_layer.edge_color_cycle = ["red", "green"]
                     
                     # Set up features for point type
                     if len(pts_arr) > 0:
                         point_layer.features = {
-                            'point_type': np.zeros(len(pts_arr), dtype=int),  # 0 = positive/green by default
+                            'point_type': np.zeros(len(pts_arr), dtype=int),  # 0 = positive/red by default
                             'label': np.array(['0'] * len(pts_arr))  # String labels for compatibility
                         }
                         point_layer.face_color = 'point_type'
@@ -5506,7 +5579,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     box_layer = self._viewer.layers["prompts"] if "prompts" in self._viewer.layers else None
                     
                     # Get point labels from features and convert to SAM format
-                    # Our point_type: 0=positive/green, 1=negative/red
+                    # Our point_type: 0=positive/red, 1=negative/green
                     # SAM expects: 1=positive, 0=negative
                     point_labels = np.ones(len(pts_arr), dtype=int)  # Default to positive
                     if point_layer is not None and hasattr(point_layer, 'features'):

@@ -4,7 +4,7 @@ import napari
 
 # data = np.load("/Users/arnlois/data/code/sub-20190928-13_ses-20190928_ophys_calcium.npz")   
 
-data = np.load("/Users/arnlois/data/code/sub-20191030-07_ses-20191030_ophys_calcium.npz")   
+data = np.load("EEexampleofcalciumimaging.npz")   
 
 calcium = data["calcium"]
 calcium_seg = data["calcium_seg"]        

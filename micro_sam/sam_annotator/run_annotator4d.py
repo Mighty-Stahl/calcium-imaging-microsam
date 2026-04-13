@@ -12,7 +12,10 @@ except Exception:
 
 from micro_sam.sam_annotator.annotator_4d import MicroSAM4DAnnotator
 
+# Calculate IoU considering movement:
 
+#         Blob1@(10,50,85)  Blob2@(10,60,90)  Blob3@(10,70,75)
+#
 
 
 # fake data 
@@ -70,9 +73,9 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
-   # default_npz_path = "calcium_extracted_gaussian_full.npz"
-# "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
+    default_npz_path = "EEexampleofcalciumimaging.npz"
+    #default_npz_path = "calcium_extracted_gaussian.npz"
+# "/Users/arnlois/data/code/calcium_extracted_gaussian.npz"
 
 
     if image4d is None:
