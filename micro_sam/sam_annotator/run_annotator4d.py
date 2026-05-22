@@ -12,13 +12,7 @@ except Exception:
 
 from micro_sam.sam_annotator.annotator_4d import MicroSAM4DAnnotator
 
-# Calculate IoU considering movement:
 
-#         Blob1@(10,50,85)  Blob2@(10,60,90)  Blob3@(10,70,75)
-#
-
-
-# fake data 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run MicroSAM 4D annotator demo")
     parser.add_argument("--fake-data", action="store_true", help="Use synthetic 4D data")
@@ -34,21 +28,18 @@ def main(argv=None):
         return 1
 
     image4d = None
-    # If a path is provided, try to load the NPZ and auto-detect the array
     if args.path is not None:
         path = args.path
         print(f"Loading NPZ from: {path}")
         try:
-            # Try memmap mode for large files; np.load on .npz may accept mmap_mode
             npz = np.load(path, mmap_mode='r')
         except TypeError:
-            # older numpy versions may not accept mmap_mode for npz; fall back
             npz = np.load(path)
         except Exception as e:
             print(f"Failed to open NPZ: {e}")
             return 2
 
-        # If the NPZ contains multiple arrays, pick a sensible name
+
         if isinstance(npz, np.lib.npyio.NpzFile):
             keys = list(npz.files)
             print(f"NPZ keys found: {keys}")
@@ -73,9 +64,7 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "calcium_extracted1.npz"
-    #default_npz_path = "calcium_extracted_gaussian.npz"
-# "/Users/arnlois/data/code/calcium_extracted_gaussian.npz"
+    default_npz_path = "/Users/arnlois/data/code/edited_sub-20191030-07_ses-20191030_ophys_calcium.npz"
 
 
     if image4d is None:
@@ -106,7 +95,7 @@ def main(argv=None):
         return 2
 
     # Limit timestep sbased on what u like
-    image4d = image4d[1:200]
+    image4d = image4d[1:100]
     
     #    image4d = image4d[10:900]
     
