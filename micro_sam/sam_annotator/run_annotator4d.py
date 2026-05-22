@@ -73,7 +73,7 @@ def main(argv=None):
             # single .npy file loaded
             image4d = npz
 
-    default_npz_path = "EEexampleofcalciumimaging.npz"
+    default_npz_path = "calcium_extracted1.npz"
     #default_npz_path = "calcium_extracted_gaussian.npz"
 # "/Users/arnlois/data/code/calcium_extracted_gaussian.npz"
 
